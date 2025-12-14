@@ -1,14 +1,14 @@
-use asky::Select;
 use color_eyre::{
     Result,
     eyre::{Context, eyre},
+    owo_colors::OwoColorize,
 };
+use dialoguer::Select;
 use ext4_rs::{BLOCK_SIZE, BlockDevice, Ext4};
 use glob::glob;
 use gpt::partition_types::OperatingSystem::Linux;
 use gpt::partition_types::Type;
 use std::{path::PathBuf, sync::Arc};
-use ziti_api::models::IdentityEnrollmentsOtt;
 
 const SECTOR_SIZE: usize = 512;
 
@@ -20,8 +20,7 @@ pub struct DiskImage {
 
 impl BlockDevice for DiskImage {
     fn read_offset(&self, mut offset: usize) -> Vec<u8> {
-        dbg!(offset);
-        // Correct our offset, our image has a sector size of 
+        // Correct our offset, our image has a sector size of
         offset += self.partition_offset * SECTOR_SIZE;
 
         use std::fs::OpenOptions;
@@ -83,7 +82,7 @@ pub fn choose_image() -> Result<Option<PathBuf>> {
     let path = match paths.len() {
         0 => {
             println!(
-                "Couldn't find any disk images. Make sure that they use the .img file extension and place them in the current-, home- or configuration directory."
+                "{}", "Couldn't find any disk images. Make sure that they use the .img file extension and place them in the current-, home- or configuration directory.".red()
             );
             None
         }
@@ -92,23 +91,22 @@ pub fn choose_image() -> Result<Option<PathBuf>> {
             Some(paths.first().unwrap())
         }
         2.. => {
-            let answer = Select::new(
-                "Found multiple disk images. Please select the correct one:",
-                paths.into_iter().map(|path| path.display().to_string()),
-            )
-            .prompt()?;
-            Some(&PathBuf::from(answer))
+            let answer = Select::new()
+                .with_prompt("Found multiple disk images. Please select the correct one:")
+                .items(paths.iter().map(|path| path.display().to_string()))
+                .interact()?;
+            Some(&paths[answer])
         }
     };
 
     Ok(path.cloned())
 }
 
-pub fn create_zitibox_image(enrollment: IdentityEnrollmentsOtt) -> Result<Option<PathBuf>> {
+pub fn create_zitibox_image(jwt: String) -> Result<()> {
     let image = choose_image();
 
     if let Ok(Some(path)) = image {
-        // Find partition start
+        // Read the partition table and find the start of the first partition
         let cfg = gpt::GptConfig::new().writable(false);
         let disk = cfg.open(&path)?;
         let (_, partition) = disk
@@ -116,27 +114,40 @@ pub fn create_zitibox_image(enrollment: IdentityEnrollmentsOtt) -> Result<Option
             .first_key_value()
             .ok_or(eyre!("Couldn't find a partition in the disk image"))?;
 
-        dbg!(&partition);
         if let Type { os: Linux, .. } = partition.part_type_guid {
-            // Write file
+            // Open the first partition as an ext4 block device
             let disk = Arc::new(DiskImage {
                 path,
                 partition_offset: partition.first_lba as usize,
             });
             let ext4 = Ext4::open(disk);
 
-            // Insert our identity
-            for i in 0..10 {
-                let path = format!("dirtest{}", i);
-                let path = path.as_str();
-                let r = ext4.dir_mk(path);
-                assert!(r.is_ok(), "dir make error {:?}", r.err());
+            // Get identity directory
+            let path = "/opt/openziti/etc/identities/";
+            let inode = ext4.ext4_dir_open(path).map_err(|e| {
+                eyre!(
+                    "Couldn't find inode for Ziti identity directory opt/openziti/etc/identities/
+Ensure that the chosen image is a ZitiBox image: {e:#?}"
+                )
+            })?;
+
+            // Remove old files from identity directory
+            for entry in ext4.ext4_dir_get_entries(inode) {
+                println!("{}{}", path, entry.get_name());
+                ext4.file_remove(&format!("{}{}", path, entry.get_name()))
+                    .map_err(|e| {
+                        eyre!("Can't remove old files in the Ziti identitiy directory: {e:#?}")
+                    })?;
             }
 
-            let path = "dir1/dir2/dir3/dir4/dir5/dir6";
-            let r = ext4.dir_mk(path);
-            
-            assert!(r.is_ok(), "dir make error {:?}", r.err());
+            // Create jwt file in identities directory
+            let jwt_file = ext4
+                .ext4_file_open(&format!("{}identity.jwt", path), "w")
+                .map_err(|e| eyre!("Couldn't create the jwt file in the disk image: {e:#?}"))?;
+
+            // Write the jwt into the file
+            ext4.ext4_file_write(jwt_file.into(), 0, jwt.as_bytes())
+                .map_err(|e| eyre!("Couldn't write jwt into the disk image: {e:#?}"))?;
         } else {
             return Err(eyre!(
                 "First partition in image does not contain a Linux host"
@@ -144,5 +155,5 @@ pub fn create_zitibox_image(enrollment: IdentityEnrollmentsOtt) -> Result<Option
         }
     }
 
-    Ok(None)
+    Ok(())
 }
