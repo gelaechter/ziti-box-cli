@@ -5,11 +5,9 @@ use color_eyre::{
     eyre::{Context, eyre},
     owo_colors::OwoColorize,
 };
-use comfy_table::Table;
-use dialoguer::{Confirm, Input, Password};
 use keyring::KeyringEntry;
 use once_cell::sync::Lazy;
-use reqwest::Client;
+use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, path::PathBuf};
 use ziti_api::{
@@ -17,12 +15,9 @@ use ziti_api::{
         authentication_api::authenticate,
         configuration::{ApiKey, Configuration},
         identity_api::{detail_identity, list_identities},
-        informational_api,
+        informational_api::{self},
     },
-    models::{
-        Authenticate, IdentityDetail, IdentityEnrollments,
-        identity_detail::EdgeRouterConnectionStatus,
-    },
+    models::{Authenticate, CurrentApiSessionDetail, IdentityDetail, IdentityEnrollments},
 };
 
 static CONFIG_PATH: Lazy<PathBuf> =
@@ -30,8 +25,12 @@ static CONFIG_PATH: Lazy<PathBuf> =
 
 const ZITIBOX_ROLE: &str = "ZitiBox";
 
+/// API providing us access to the OpenZiti Controller
+/// The instantiation of this API implies authorization
 #[derive(Serialize, Deserialize)]
 pub struct ZitiApi {
+    /// Ziti endpoint url
+    url: Url,
     /// If our reqwest client should also accept
     accept_bad_tls: bool,
     /// The authenticating user
@@ -39,32 +38,169 @@ pub struct ZitiApi {
     /// ISO 8061 datetime denoting the session expiration
     session_expiration: String,
     /// OpenApi configuration
+    #[serde(skip)]
+    // no serialization because it is partly unserializable and contains credentials
     conf: Configuration,
 }
 
 impl ZitiApi {
-    /// Constructs a ZitiApi by first trying to find the config and otherwise starting first time setup
+    /// Saves this configuration of the ZitiApi
+    pub async fn save(
+        url: Url,
+        accept_bad_tls: bool,
+        username: String,
+        password: String,
+    ) -> Result<ZitiApi> {
+        let mut conf = Configuration::new();
+        conf.base_path = url.to_string();
+        conf.client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(accept_bad_tls)
+            .build()?;
+
+        let mut auth = Authenticate::new();
+        auth.username = Some(username.clone());
+        auth.password = Some(password.clone());
+
+        match authenticate(&conf, "password", Some(auth)).await {
+            Ok(session) => {
+                //  Save credentials to keyring
+                let entry = KeyringEntry::try_new(&username)?;
+                entry.set_secret(password).await?;
+
+                let entry = KeyringEntry::try_new("session")?;
+                entry.set_secret(session.data.token.clone()).await?;
+
+                // Write token to config
+                conf.api_key = Some(ApiKey {
+                    prefix: None,
+                    key: session.data.token,
+                });
+
+                let api = ZitiApi {
+                    url,
+                    accept_bad_tls,
+                    username,
+                    session_expiration: session.data.expires_at,
+                    conf,
+                };
+
+                api.save_to_file(&CONFIG_PATH)
+                    .await
+                    .wrap_err("Couldn't save config")?;
+
+                Ok(api)
+            }
+            Err(e) => Err(eyre!(e)),
+        }
+    }
+
+    /// Trys to load the ZitiApi from a saved config
     pub async fn load() -> Result<Option<Self>> {
         match ZitiApi::load_from_file(&CONFIG_PATH).await {
             Ok(opt) => Ok(match opt {
                 // Either use the existing config
                 Some(mut api) => {
-                    // Additionally build reqwest client based on `accept_bad_tls`, since we can't serialize it
+                    // Instantiate reqwest client
                     api.conf.client = Client::builder()
                         .danger_accept_invalid_certs(api.accept_bad_tls)
                         .build()?;
 
-                    // Ziti sessions last about half an hour, reauth if it expires
-                    if api.session_expired()? {
-                        api.reauth().await?
-                    }
+                    // Set url
+                    api.conf.base_path = api.url.to_string();
+
+                    // Ziti sessions last about half an hour, reauth if it has expired since then
+                    let token = if api.session_expired()? {
+                        // Reauth if expired
+                        let session = api.reauth().await?;
+                        api.session_expiration = session.expires_at;
+
+                        println!(
+                            "{} {}",
+                            "Successfully reauthenticated as".cyan(),
+                            session.identity.name.unwrap_or(api.username.clone()).cyan()
+                        );
+
+                        // Save session token and return it
+                        let entry = KeyringEntry::try_new("session")?;
+                        entry.set_secret(session.token.clone()).await?;
+                        session.token
+                    } else {
+                        // Load session token if still valid and reutrn it
+                        let entry = KeyringEntry::try_new("session")?;
+                        entry.get_secret().await?
+                    };
+
+                    // Set token
+                    api.conf.api_key = Some(ApiKey {
+                        prefix: None,
+                        key: token,
+                    });
 
                     Some(api)
                 }
-                // Or create start first time configuration
                 None => None,
             }),
             Err(e) => Err(e).wrap_err("Couldn't load configuration file"),
+        }
+    }
+
+    /// Checks if an endpoint is reachable
+    pub async fn try_endpoint(
+        url: Url,
+        accept_bad_tls: bool,
+    ) -> Result<(), EndpointError<Box<dyn Error>>> {
+        let mut conf = Configuration::new();
+        conf.base_path = url.to_string();
+        conf.client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(accept_bad_tls)
+            .build()
+            .map_err(|e| EndpointError::Unknown(e.into()))?;
+
+        match informational_api::list_root(&conf).await {
+            // Exit retry loop if the connection works
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Check if this might be because of self signed certs
+                if let ziti_api::apis::Error::Reqwest(ref err) = e
+                        // here we need to access the underlying SSL error
+                        && let Some(err) = err.source().and_then(|err| err.source())
+                        && format!("{}", err)
+                            .contains("self-signed certificate in certificate chain")
+                {
+                    Err(EndpointError::TLSError)
+                } else {
+                    Err(EndpointError::Unknown(e.into()))
+                }
+            }
+        }
+    }
+
+    /// Returns true if authentication was successful, otherwise returns an
+    pub async fn try_authenticate(
+        url: Url,
+        accept_bad_tls: bool,
+        username: String,
+        password: String,
+    ) -> Result<bool> {
+        let mut conf = Configuration::new();
+        conf.base_path = url.to_string();
+        conf.client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(accept_bad_tls)
+            .build()?;
+
+        let mut auth = Authenticate::new();
+        auth.username = Some(username.clone());
+        auth.password = Some(password.clone());
+
+        match authenticate(&conf, "password", Some(auth)).await {
+            // Successfully authenticated
+            Ok(_) => Ok(true),
+            // Wrong credentials
+            Err(ziti_api::apis::Error::ResponseError(response_content)) => {
+                Ok(response_content.status == StatusCode::UNAUTHORIZED)
+            }
+            // Unknown error
+            Err(e) => Err(eyre!(e)),
         }
     }
 
@@ -74,7 +210,7 @@ impl ZitiApi {
     }
 
     /// Lets us reauth using existing credentials if our sessione expires
-    async fn reauth(&mut self) -> Result<()> {
+    async fn reauth(&mut self) -> Result<CurrentApiSessionDetail> {
         let username = self.username.clone();
         let entry = KeyringEntry::try_new(&username)?;
         let password = entry.get_secret().await?;
@@ -85,148 +221,16 @@ impl ZitiApi {
 
         let session = authenticate(&self.conf, "password", Some(auth)).await?;
 
-        println!(
-            "{} {}",
-            "Successfully reauthenticated as".cyan(),
-            session
-                .data
-                .identity
-                .name
-                .unwrap_or(self.username.clone())
-                .cyan()
-        );
-
         self.conf.api_key = Some(ApiKey {
             prefix: None,
-            key: session.data.token,
+            key: session.data.token.clone(),
         });
 
-        Ok(())
-    }
-
-    /// Starts the first time configuration dialogue
-    pub async fn first_time_configuration() -> Result<Self> {
-        let mut conf = Configuration::new();
-
-        // We may need to allow self signed certs
-        let url: String = Input::new()
-            .with_prompt("Enter controller url (e.g. https://controller.ziti:1280)")
-            .with_initial_text("https://")
-            .interact_text()?;
-
-        let url = format!("{url}/edge/management/v1");
-
-        conf.base_path = url;
-        conf.client = reqwest::Client::new();
-
-        let mut accept_bad_tls = false;
-
-        // Retry if we allow bad tls
-        loop {
-            // Check if we can connect
-            match informational_api::list_root(&conf).await {
-                // Exit retry loop if the connection works
-                Ok(_) => {
-                    println!("{}", "Endpoint is responding".green());
-                    break;
-                }
-                Err(e) => {
-                    // Check if this might be because of self signed certs
-                    if let ziti_api::apis::Error::Reqwest(ref err) = e
-                        // here we need to access the underlying SSL error
-                        && let Some(err) = err.source().and_then(|err| err.source())
-                        && format!("{}", err)
-                            .contains("self-signed certificate in certificate chain")
-                    {
-                        println!("{}", "Cannot connect to endpoint, the controller certificate seems to be self-signed.".bright_red());
-
-                        // Ask user to allow bad tls
-                        accept_bad_tls = Confirm::new()
-                            .with_prompt(format!(
-                                "{}",
-                                "Accept invalid TLS certs? Only allow this if you self signed your certs.".bright_red()
-                            ))
-                            .interact()?;
-
-                        // If so change reqwest settings and retry
-                        conf.client = reqwest::Client::builder()
-                            .danger_accept_invalid_certs(accept_bad_tls)
-                            .build()?;
-
-                        println!("Retrying...")
-                    } else {
-                        // If this is a generic error then just error out
-                        println!(
-                        "{}",
-                        "Cannot connect to endpoint, please make sure you entered the correct URL."
-                            .red()
-                    );
-                        return Err(e).wrap_err("Couldn't contact endpoint");
-                    }
-                }
-            };
-        }
-
-        let mut auth = Authenticate::new();
-
-        loop {
-            let mut username_prompt = Input::new().with_prompt("Enter username");
-            if let Some(username) = auth.username {
-                username_prompt = username_prompt.with_initial_text(username);
-            }
-            let username: String = username_prompt.interact_text()?;
-            let password = Password::new().with_prompt("Enter password").interact()?;
-
-            auth.username = Some(username.clone());
-            auth.password = Some(password.clone());
-
-            // Check if we can authenticate
-            match authenticate(&conf, "password", Some(auth.clone())).await {
-                Ok(session) => {
-                    // If successful
-                    let msg = format!(
-                        "Successfully authenticated as {}. Saving config...",
-                        session.data.identity.name.unwrap_or(username.clone())
-                    );
-                    println!("{}", msg.green());
-
-                    // save the user password into a local keyring
-                    let entry = KeyringEntry::try_new(&username)?;
-                    entry.set_secret(password).await?;
-
-                    // save the api token
-                    conf.api_key = Some(ApiKey {
-                        prefix: None,
-                        key: session.data.token,
-                    });
-
-                    // save the username, OpenApi config and session expiration date
-                    let api = ZitiApi {
-                        accept_bad_tls,
-                        conf,
-                        username,
-                        session_expiration: session.data.expires_at,
-                    };
-
-                    api.save_to_file(&CONFIG_PATH)
-                        .await
-                        .wrap_err("Couldn't save config")?;
-
-                    return Ok(api);
-                }
-                Err(_) => {
-                    println!(
-                        "{}",
-                        "Couldn't authenticate. Make sure you entered the correct credentials:"
-                            .bright_red()
-                    )
-                }
-            };
-        }
+        Ok(*session.data)
     }
 
     /// Lists all ziti box identites
-    pub async fn list_ziti_boxes(&self) -> Result<()> {
+    pub async fn list_ziti_boxes(&self) -> Result<Vec<IdentityDetail>> {
         let identities: Vec<IdentityDetail> =
             list_identities(&self.conf, None, None, None, None, None)
                 .await
@@ -241,38 +245,7 @@ impl ZitiApi {
                 })
                 .collect();
 
-        if identities.is_empty() {
-            println!("{}", "There are no Ziti Box identities to display.".cyan());
-            return Ok(());
-        }
-
-        println!("{}", "Listing Ziti Box identities:".cyan());
-
-        // Build a table from our identities
-        let mut table = Table::new();
-        table.set_header(vec!["Id", "Status", "Name", "Enrollment"]);
-
-        for zitibox in identities {
-            table.add_row(vec![
-                zitibox.id,
-                match &zitibox.edge_router_connection_status {
-                    EdgeRouterConnectionStatus::Online => "Online".green().to_string(),
-                    EdgeRouterConnectionStatus::Offline => "Offline".red().to_string(),
-                    EdgeRouterConnectionStatus::Unknown => "Unknown".yellow().to_string(),
-                },
-                zitibox.name,
-                match Self::parse_enrollment_state(&zitibox.enrollment) {
-                    EnrollmentState::Enrolled => "Already enrolled".green().to_string(),
-                    EnrollmentState::Expired => "Enrollment expired".red().to_string(),
-                    EnrollmentState::ReadyToEnroll => "Ready to enroll".blue().to_string(),
-                    EnrollmentState::Unknown => "Unknown enrollment state".yellow().to_string(),
-                },
-            ]);
-        }
-
-        println!("{table}");
-
-        Ok(())
+        Ok(identities)
     }
 
     /// Takes a ziti_api::IdentityEnrollments and parses it into our own EnrollmentState
@@ -308,6 +281,12 @@ impl ZitiApi {
             ))
         }
     }
+}
+
+#[derive(Debug)]
+pub enum EndpointError<T> {
+    TLSError,
+    Unknown(T),
 }
 
 pub enum EnrollmentState {
