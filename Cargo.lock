@@ -1720,19 +1720,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openapi"
-version = "0.26.51"
-dependencies = [
- "reqwest",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3580,11 +3567,25 @@ dependencies = [
  "gpt",
  "keyring-lib",
  "once_cell",
- "openapi",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "ziti_edge_management_api",
+]
+
+[[package]]
+name = "ziti_edge_management_api"
+version = "0.26.51"
+source = "git+https://github.com/gelaechter/ziti_edge_management_api.git#3803113a1ca60afba3629f28a68af63867e505c5"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "url",
+ "uuid",
 ]
 
 [[package]]
