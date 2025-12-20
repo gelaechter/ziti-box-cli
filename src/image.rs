@@ -1,7 +1,6 @@
 use color_eyre::{
     Result,
     eyre::{Context, eyre},
-    owo_colors::OwoColorize,
 };
 use dialoguer::Select;
 use ext4_rs::{BLOCK_SIZE, BlockDevice, Ext4};
@@ -9,6 +8,8 @@ use glob::glob;
 use gpt::partition_types::OperatingSystem::Linux;
 use gpt::partition_types::Type;
 use std::{path::PathBuf, sync::Arc};
+
+use crate::TextColors;
 
 const SECTOR_SIZE: usize = 512;
 
@@ -82,7 +83,7 @@ pub fn choose_image() -> Result<Option<PathBuf>> {
     let path = match paths.len() {
         0 => {
             println!(
-                "{}", "Couldn't find any disk images. Make sure that they use the .img file extension and place them in the current-, home- or configuration directory.".red()
+                "{}", "Couldn't find any disk images. Make sure that they use the .img file extension and place them in the current-, home- or configuration directory.".alert()
             );
             None
         }
@@ -122,38 +123,58 @@ pub fn create_zitibox_image(jwt: String) -> Result<()> {
             });
             let ext4 = Ext4::open(disk);
 
-            // Get identity directory
-            let path = "/opt/openziti/etc/identities/";
-            let inode = ext4.ext4_dir_open(path).map_err(|e| {
-                eyre!(
-                    "Couldn't find inode for Ziti identity directory opt/openziti/etc/identities/
-Ensure that the chosen image is a ZitiBox image: {e:#?}"
-                )
-            })?;
-
-            // Remove old files from identity directory
-            for entry in ext4.ext4_dir_get_entries(inode) {
-                println!("{}{}", path, entry.get_name());
-                ext4.file_remove(&format!("{}{}", path, entry.get_name()))
-                    .map_err(|e| {
-                        eyre!("Can't remove old files in the Ziti identitiy directory: {e:#?}")
-                    })?;
-            }
-
-            // Create jwt file in identities directory
-            let jwt_file = ext4
-                .ext4_file_open(&format!("{}identity.jwt", path), "w")
-                .map_err(|e| eyre!("Couldn't create the jwt file in the disk image: {e:#?}"))?;
-
-            // Write the jwt into the file
-            ext4.ext4_file_write(jwt_file.into(), 0, jwt.as_bytes())
-                .map_err(|e| eyre!("Couldn't write jwt into the disk image: {e:#?}"))?;
+            write_ziti_jwt(&ext4, jwt)?;
+            // TOOD: Should set the hostname based on the
+            // write_hostname(&ext4, );
         } else {
             return Err(eyre!(
-                "First partition in image does not contain a Linux host"
+                "First partition in image does not contain an EXT4 Linux host"
             ));
         }
     }
+
+    Ok(())
+}
+
+pub fn write_ziti_jwt(ext4: &Ext4, jwt: String) -> Result<()> {
+    // Get identity directory
+    let path = "/opt/openziti/etc/identities/";
+    let inode = ext4.ext4_dir_open(path).map_err(|e| {
+        eyre!(
+            "Couldn't find inode for Ziti identity directory opt/openziti/etc/identities/
+            Ensure that the chosen image is a ZitiBox image: {e:#?}"
+        )
+    })?;
+
+    // Remove old files from identity directory
+    for entry in ext4.ext4_dir_get_entries(inode) {
+        println!("{}{}", path, entry.get_name());
+        ext4.file_remove(&format!("{}{}", path, entry.get_name()))
+            .map_err(|e| {
+                eyre!("Can't remove old files in the Ziti identitiy directory:\n{e:#?}")
+            })?;
+    }
+
+    // Create jwt file in identities directory
+    let jwt_file = ext4
+        .ext4_file_open(&format!("{}identity.jwt", path), "w")
+        .map_err(|e| eyre!("Couldn't create the jwt file in the disk image:\n{e:#?}"))?;
+
+    // Write the jwt into the file
+    ext4.ext4_file_write(jwt_file.into(), 0, jwt.as_bytes())
+        .map_err(|e| eyre!("Couldn't write jwt into the disk image:\n{e:#?}"))?;
+
+    Ok(())
+}
+
+pub fn write_hostname(ext4: &Ext4, hostname: String) -> Result<()> {
+    let jwt_file = ext4
+        .ext4_file_open("/etc/hostname", "w")
+        .map_err(|e| eyre!("Couldn't open the hostname file in the disk image:\n{e:#?}"))?;
+
+    // Write the jwt into the file
+    ext4.ext4_file_write(jwt_file.into(), 0, hostname.as_bytes())
+        .map_err(|e| eyre!("Couldn't write the hostname into the disk image:\n{e:#?}"))?;
 
     Ok(())
 }

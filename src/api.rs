@@ -1,32 +1,37 @@
-use crate::config::Serializable;
-use chrono::{DateTime, Utc};
+use crate::{TextColors, config::Serializable};
+use chrono::{DateTime, Duration, Utc};
 use color_eyre::{
     Result,
     eyre::{Context, eyre},
-    owo_colors::OwoColorize,
 };
 use keyring::KeyringEntry;
-use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, path::PathBuf};
+use std::{error::Error, path::PathBuf, sync::LazyLock};
 use ziti_api::{
     apis::{
         authentication_api::authenticate,
         configuration::{ApiKey, Configuration},
-        identity_api::{detail_identity, list_identities},
+        identity_api::{create_identity, delete_identity, detail_identity, list_identities},
         informational_api::{self},
     },
-    models::{Authenticate, CurrentApiSessionDetail, IdentityDetail, IdentityEnrollments},
+    models::{
+        Authenticate, CurrentApiSessionDetail, EnrollmentCreate, IdentityCreate,
+        IdentityCreateEnrollment, IdentityDetail, IdentityEnrollments, IdentityType,
+        enrollment_create::Method,
+    },
 };
 
-static CONFIG_PATH: Lazy<PathBuf> =
-    Lazy::new(|| dirs_next::config_dir().unwrap().join("zitibox/api.json"));
+static CONFIG_PATH: LazyLock<PathBuf> =
+    LazyLock::new(|| dirs_next::config_dir().unwrap().join("zitibox/api.json"));
 
 const ZITIBOX_ROLE: &str = "ZitiBox";
 
 /// API providing us access to the OpenZiti Controller
-/// The instantiation of this API implies authorization
+/// An instance of this API implies the following:
+///     - The url the correct base path for the edge management api
+///     - The username is valid
+///     - A valid session has at some point existed and the user password is stored in the keyring
 #[derive(Serialize, Deserialize)]
 pub struct ZitiApi {
     /// Ziti endpoint url
@@ -109,25 +114,25 @@ impl ZitiApi {
                     api.conf.base_path = api.url.to_string();
 
                     // Ziti sessions last about half an hour, reauth if it has expired since then
-                    let token = if api.session_expired()? {
+                    let (token, reauth) = if api.session_expired()? {
                         // Reauth if expired
                         let session = api.reauth().await?;
                         api.session_expiration = session.expires_at;
 
-                        println!(
-                            "{} {}",
-                            "Successfully reauthenticated as".cyan(),
-                            session.identity.name.unwrap_or(api.username.clone()).cyan()
-                        );
+                        let msg =
+                            format!("Successfully reauthenticated as {}", api.username.clone())
+                                .info()
+                                .to_string();
+                        println!("{}", msg);
 
                         // Save session token and return it
                         let entry = KeyringEntry::try_new("session")?;
                         entry.set_secret(session.token.clone()).await?;
-                        session.token
+                        (session.token, true)
                     } else {
                         // Load session token if still valid and reutrn it
                         let entry = KeyringEntry::try_new("session")?;
-                        entry.get_secret().await?
+                        (entry.get_secret().await?, false)
                     };
 
                     // Set token
@@ -135,6 +140,13 @@ impl ZitiApi {
                         prefix: None,
                         key: token,
                     });
+
+                    // And save the new expiration datetime if we had to reauth
+                    if reauth {
+                        api.save_to_file(&CONFIG_PATH)
+                            .await
+                            .wrap_err("Couldn't save config")?;
+                    }
 
                     Some(api)
                 }
@@ -248,9 +260,107 @@ impl ZitiApi {
         Ok(identities)
     }
 
-    /// Takes a ziti_api::IdentityEnrollments and parses it into our own EnrollmentState
-    /// this gives us an ergonomic type for UI
-    pub fn parse_enrollment_state(enrollment: &IdentityEnrollments) -> EnrollmentState {
+    /// Resets the enrollment for an identity with a string
+    pub async fn reset_enrollment(&self, id: String) -> Result<()> {
+        // This ensures that the id belongs to a ZitiBox
+        let zitibox = self.get_ziti_box(id).await?;
+
+        // Delete the previous enrollment (if it exists)
+        if let Some(ott) = &zitibox.enrollment.ott
+            && let Some(id) = &ott.id
+        {
+            ziti_api::apis::enrollment_api::delete_enrollment(&self.conf, id)
+                .await
+                .wrap_err("Couldn't delete the enrollment for this identity")?;
+        };
+
+        // Create a new one
+        ziti_api::apis::enrollment_api::create_enrollment(
+            &self.conf,
+            EnrollmentCreate {
+                expires_at: (Utc::now() + Duration::minutes(30)).to_rfc3339(),
+                identity_id: zitibox.id,
+                method: Method::Ott,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_ziti_box(&self, id: String) -> Result<IdentityDetail> {
+        let identity = detail_identity(&self.conf, &id).await?.data;
+        if let Some(roles) = &identity.role_attributes
+            && roles.contains(&ZITIBOX_ROLE.to_string())
+        {
+            Ok(*identity)
+        } else {
+            Err(eyre!(
+                "This identity doesn't seem to be a ZitiBox identity. The \"ZitiBox\" role is missing."
+            ))
+        }
+    }
+
+    pub async fn create_ziti_box(&self, name: String) -> Result<()> {
+        create_identity(
+            &self.conf,
+            IdentityCreate {
+                enrollment: Some(Box::new(IdentityCreateEnrollment {
+                    ott: Some(true),
+                    ..Default::default()
+                })),
+                name,
+                role_attributes: Some(Some(vec![ZITIBOX_ROLE.to_string()])),
+                r#type: IdentityType::Default,
+                ..Default::default()
+            },
+        )
+        .await
+        .wrap_err("Couldn't create Ziti Box identity")?;
+
+        Ok(())
+    }
+
+    pub async fn delete_ziti_box(&self, ziti_box_id: String) -> Result<()> {
+        delete_identity(&self.conf, &ziti_box_id)
+            .await
+            .wrap_err("Couldn't delete Ziti Box identity")?;
+
+        Ok(())
+    }
+
+    pub async fn bootstrap_ziti_network(&self) -> Result<()> {
+        // Heres the plan
+        // 1. Check if a ZitiBoxCli identity already exists
+        // 2. If it doesn't create it
+        // 3. If need be re-enroll it
+        // 4. Enroll the create OTT using Edge Client API
+        // 5. Download the newly enrolled certificate
+        // 6. Use the identity file with the ZitiAPI rust crate
+        // 7. Access the ZitiBox using openssh 
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+pub enum EndpointError<T> {
+    TLSError,
+    Unknown(T),
+}
+
+#[derive(PartialEq, Eq)]
+pub enum EnrollmentState {
+    Enrolled,
+    Expired,
+    ReadyToEnroll,
+    Unknown,
+}
+
+impl From<&IdentityEnrollments> for EnrollmentState {
+    /// Takes a ziti_api::IdentityEnrollments and parses it into our own EnrollmentState\
+    /// EnrollmentState is a lot more ergonomic for UI code
+    fn from(enrollment: &IdentityEnrollments) -> Self {
         match enrollment {
             IdentityEnrollments { ott: None, .. } => EnrollmentState::Enrolled,
             IdentityEnrollments { ott: Some(ott), .. } => {
@@ -268,30 +378,4 @@ impl ZitiApi {
             }
         }
     }
-
-    pub async fn get_ziti_box(&self, id: String) -> Result<IdentityDetail> {
-        let identity = detail_identity(&self.conf, &id).await?.data;
-        if let Some(roles) = &identity.role_attributes
-            && roles.contains(&ZITIBOX_ROLE.to_string())
-        {
-            Ok(*identity)
-        } else {
-            Err(eyre!(
-                "This identity doesn't seem to be a ZitiBox identity. The \"ZitiBox\" role is missing."
-            ))
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum EndpointError<T> {
-    TLSError,
-    Unknown(T),
-}
-
-pub enum EnrollmentState {
-    Enrolled,
-    Expired,
-    ReadyToEnroll,
-    Unknown,
 }

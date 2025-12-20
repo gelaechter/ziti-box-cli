@@ -57,7 +57,7 @@ sudo systemctl restart ziti-edge-tunnel.service
 # Clear preconfigured netplan settings
 rm /etc/netplan/*
 # Write netplan config
-cat <<"EOF" > /etc/netplan/50-cloud-init.yaml
+cat <<"EOF" > /etc/netplan/50-zitibox.yaml
 network:
     ethernets:
         end0:
@@ -69,7 +69,7 @@ network:
     version: 2
 EOF
 # Change permissions
-chmod 600 /etc/netplan/50-cloud-init.yaml
+chmod a=,u=rw /etc/netplan/50-zitibox.yaml
 # Apply netplan config
 netplan generate
 netplan apply

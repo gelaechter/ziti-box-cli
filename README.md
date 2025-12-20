@@ -5,6 +5,7 @@ This CLI Utility let's you manage Ziti Boxes.
 Ziti Boxes are Linux Router boards that act as an entry into an OpenZiti network.
 This CLI utility intends to make the creation of disk images and for flashing these as easy as possible.
 
+
 ## Building from source
 
 This program is written in rust.
@@ -34,3 +35,11 @@ It makes use of the [error_in_core feature](https://github.com/rust-lang/rust/is
     ```
     *This should compile and install the binary into `$HOME/.cargo/bin`.
      It should then be available in your shell.*
+
+
+# Points for improvement
+
+1. This application currently requires a Keyring Service a fallback for running without one would make sense
+2. Make ZitiBox logs / ssh / firewall configuration accessible
+3. Build a better UI
+4. (Very optional) Support Copy-on-write filesystems (btrfs, etc.) to store more than one disk image
