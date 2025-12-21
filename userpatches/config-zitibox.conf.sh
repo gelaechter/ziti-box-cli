@@ -1,0 +1,5 @@
+export BOARD="nanopi-r3s-lts"
+export BRANCH="current"
+export RELEASE="noble"
+export BUILD_MINIMAL="yes"
+export KERNEL_CONFIGURE="no"

@@ -22,7 +22,7 @@ use ziti_api::{
     },
 };
 
-static CONFIG_PATH: LazyLock<PathBuf> =
+pub static CONFIG_PATH: LazyLock<PathBuf> =
     LazyLock::new(|| dirs_next::config_dir().unwrap().join("zitibox/api.json"));
 
 const ZITIBOX_ROLE: &str = "ZitiBox";
@@ -333,12 +333,12 @@ impl ZitiApi {
     pub async fn bootstrap_ziti_network(&self) -> Result<()> {
         // Heres the plan
         // 1. Check if a ZitiBoxCli identity already exists
-        // 2. If it doesn't create it
-        // 3. If need be re-enroll it
-        // 4. Enroll the create OTT using Edge Client API
+        // 2. If it doesn't, create it
+        // 3. If need be, re-enroll it
+        // 4. Enroll the created OTT using Edge Client API
         // 5. Download the newly enrolled certificate
         // 6. Use the identity file with the ZitiAPI rust crate
-        // 7. Access the ZitiBox using openssh 
+        // 7. Access the ZitiBox using russh
         todo!()
     }
 }

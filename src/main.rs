@@ -2,6 +2,8 @@ mod api;
 mod config;
 mod image;
 
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use color_eyre::{
@@ -10,12 +12,16 @@ use color_eyre::{
     owo_colors::{FgColorDisplay, OwoColorize, colors},
 };
 use comfy_table::Table;
-use dialoguer::{Confirm, Input, Password};
+use dialoguer::{Confirm, Input, Password, Select};
+use glob::glob;
 use keyring::set_global_service_name;
 use reqwest::Url;
 use ziti_api::models::{IdentityEnrollmentsOtt, identity_detail::EdgeRouterConnectionStatus};
 
-use crate::api::{EnrollmentState, ZitiApi};
+use crate::{
+    api::{CONFIG_PATH, EnrollmentState, ZitiApi},
+    image::ZitiBoxImage,
+};
 
 // Define flags
 #[derive(Parser, Debug)]
@@ -46,10 +52,12 @@ pub enum SubCommands {
     Image {
         #[arg()]
         ziti_box_id: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Irreversibly deletes a Ziti Box identity
     Delete {
-        #[arg()] 
+        #[arg()]
         ziti_box_id: String,
     },
 }
@@ -70,7 +78,7 @@ pub async fn cli() -> Result<()> {
     match args.subcommand {
         SubCommands::Configure => cmd_first_time_configuration().await,
         SubCommands::List => cmd_list_ziti_boxes().await,
-        SubCommands::Image { ziti_box_id } => cmd_create_img(ziti_box_id).await,
+        SubCommands::Image { ziti_box_id, path } => cmd_create_img(ziti_box_id, path).await,
         SubCommands::ReEnroll { ziti_box_id } => cmd_re_enroll_ziti_box(ziti_box_id).await,
         SubCommands::Create { name } => cmd_create_ziti_box(name).await,
         SubCommands::Delete { ziti_box_id } => cmd_delete_ziti_box(ziti_box_id).await,
@@ -83,7 +91,8 @@ async fn construct_ziti_api() -> Result<ZitiApi> {
         Ok(api)
     } else {
         Err(eyre!(
-            "Couldn't find a configuration. Start the first time configuration with the configure command..."
+            "Couldn't find a configuration at {}. Start the first time configuration with the configure command...",
+            CONFIG_PATH.display()
         ))
     }
 }
@@ -141,11 +150,12 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
 }
 
 /// Creates a disk image for a Ziti Box identity
-async fn cmd_create_img(ziti_box_id: String) -> Result<()> {
+async fn cmd_create_img(ziti_box_id: String, path: Option<PathBuf>) -> Result<()> {
     let ziti_box = construct_ziti_api()
         .await?
         .get_ziti_box(ziti_box_id.clone())
         .await?;
+
     // Check if the ZitiBox is ready to enroll
     if !matches!(
         EnrollmentState::from(&*ziti_box.enrollment),
@@ -163,16 +173,38 @@ async fn cmd_create_img(ziti_box_id: String) -> Result<()> {
         }
     }
 
-    if let Some(jwt) = ziti_box
+    // Now the ZitiBox is ready to enroll
+    let jwt = ziti_box
         .enrollment
         .ott
         .expect("should be guaranteed through EnrollmentState::ReadyToEnroll")
         .jwt
-    {
-        image::create_zitibox_image(jwt)
-    } else {
-        Err(eyre!("Ziti Box identity enrollment didn't contain a JWT"))
-    }
+        .ok_or(eyre!("Ziti Box identity enrollment didn't contain a JWT"))?;
+
+    // Select an image
+    let img_path = match path {
+        Some(file_path) => file_path,
+        None => choose_image()?.ok_or(eyre!(
+                "{}", "Couldn't find any disk images. Make sure that your image uses the .img file extension and place it somewhere in the home directory.
+                Alternatively use the --path option to manually define the image location instead.".alert()
+            ))?,
+    };
+
+    println!("{}", "Reading disk image...".info());
+
+    let image = ZitiBoxImage::try_from(img_path)
+        .wrap_err("The selected disk image is not a valid Ziti Box image")?;
+
+    println!("{}", "Writing JWT...".info());
+
+    image.write_ziti_jwt(jwt)?;
+
+    println!("{}", "Writing hostname".info());
+    image.write_hostname(ziti_box.id)?;
+
+    // TODO: allow for writing hosts entries
+
+    Ok(())
 }
 
 /// Starts the first time configuration dialogue
@@ -243,8 +275,15 @@ pub async fn cmd_first_time_configuration() -> Result<()> {
         {
             Ok(success) => {
                 if success {
+                    println!("{}", "Successfully authenticated".success());
+
                     // If we can then save our configuration
-                    let _ = ZitiApi::save(url, accept_bad_tls, username, password).await;
+                    ZitiApi::save(url, accept_bad_tls, username, password)
+                        .await
+                        .wrap_err("Couldn't save the configuration.")?;
+
+                    let msg = format!("Saved configuration to {}", CONFIG_PATH.display());
+                    println!("{}", msg.success());
                     return Ok(());
                 } else {
                     println!("{}", "The provided credentials are incorrect. Ensure you entered the correct credentials.".alert())
@@ -335,6 +374,14 @@ async fn cmd_delete_ziti_box(
     Ok(())
 }
 
+async fn cmd_monitor_ziti_box(ziti_box_id: String) -> Result<()> {
+    // Run an SSH session with this command:
+    // tcpdump -i enp1s0 -l -w - | tshark -l -r - -T json
+    // Parse the json, compare the addresses / ports with the rules
+    // Show the output in human readable form
+    todo!()
+}
+
 /// Define wrappers for colors
 /// TODO: consider changing each functions return type to [String] by enforcing [std::fmt::Display] and calling [Display::to_string()]
 pub trait TextColors: Sized {
@@ -371,4 +418,46 @@ pub fn pretty_expiration(ott: &IdentityEnrollmentsOtt) -> Option<String> {
                 format!("{}s", seconds)
             }
         })
+}
+
+pub fn choose_image() -> Result<Option<PathBuf>> {
+    // Directories we want to search with a *.img globbing pattern
+    let home_dir = dirs_next::home_dir().ok_or(eyre!("Couldn't find the home directory.\nUse the --path option to manually define the image location instead."))?;
+    let glob_path = home_dir
+        .join("*.img")
+        .into_os_string()
+        .into_string()
+        .map_err(|os| {
+            eyre!(
+                "Couldn't convert OsString of globbing path into String:\n{:?}",
+                os
+            )
+        })?;
+
+    // Collect globbed results
+    let paths: Vec<PathBuf> = glob(&glob_path)
+        .wrap_err("Couldn't build globbing pattern")?
+        .filter_map(Result::ok)
+        .collect();
+
+    let path = match paths.len() {
+        0 => None,
+        1 => {
+            println!("Using only disk image {}", paths.first().unwrap().display());
+            Some(paths.first().expect("Guaranteed through len == 1 check"))
+        }
+        2.. => {
+            let answer = Select::new()
+                .with_prompt(
+                    "Found multiple disk images. Please select the correct one:"
+                        .info()
+                        .to_string(),
+                )
+                .items(paths.iter().map(|path| path.display().to_string()))
+                .interact()?;
+            Some(&paths[answer])
+        }
+    };
+
+    Ok(path.cloned())
 }
