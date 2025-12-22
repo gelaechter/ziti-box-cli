@@ -1,10 +1,13 @@
-use crate::{TextColors, config::Serializable};
+use crate::{
+    TextColors,
+    config::Serializable,
+    secrets::{self},
+};
 use chrono::{DateTime, Duration, Utc};
 use color_eyre::{
     Result,
     eyre::{Context, eyre},
 };
-use keyring::KeyringEntry;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, path::PathBuf, sync::LazyLock};
@@ -69,11 +72,13 @@ impl ZitiApi {
         match authenticate(&conf, "password", Some(auth)).await {
             Ok(session) => {
                 //  Save credentials to keyring
-                let entry = KeyringEntry::try_new(&username)?;
-                entry.set_secret(password).await?;
+                secrets::key_store()
+                    .set_secret(&username, &password)
+                    .await?;
 
-                let entry = KeyringEntry::try_new("session")?;
-                entry.set_secret(session.data.token.clone()).await?;
+                secrets::key_store()
+                    .set_secret("session", &session.data.token)
+                    .await?;
 
                 // Write token to config
                 conf.api_key = Some(ApiKey {
@@ -114,6 +119,7 @@ impl ZitiApi {
                     api.conf.base_path = api.url.to_string();
 
                     // Ziti sessions last about half an hour, reauth if it has expired since then
+
                     let (token, reauth) = if api.session_expired()? {
                         // Reauth if expired
                         let session = api.reauth().await?;
@@ -126,13 +132,14 @@ impl ZitiApi {
                         println!("{}", msg);
 
                         // Save session token and return it
-                        let entry = KeyringEntry::try_new("session")?;
-                        entry.set_secret(session.token.clone()).await?;
+                        secrets::key_store()
+                            .set_secret("session", &session.token)
+                            .await?;
                         (session.token, true)
                     } else {
-                        // Load session token if still valid and reutrn it
-                        let entry = KeyringEntry::try_new("session")?;
-                        (entry.get_secret().await?, false)
+                        // Load session token if still valid and return it
+                        let secret = secrets::key_store().get_secret("session").await?;
+                        (secret, false)
                     };
 
                     // Set token
@@ -224,12 +231,14 @@ impl ZitiApi {
     /// Lets us reauth using existing credentials if our sessione expires
     async fn reauth(&mut self) -> Result<CurrentApiSessionDetail> {
         let username = self.username.clone();
-        let entry = KeyringEntry::try_new(&username)?;
-        let password = entry.get_secret().await?;
 
-        let mut auth = Authenticate::new();
-        auth.username = Some(username);
-        auth.password = Some(password);
+        let password = secrets::key_store().get_secret(&username).await?;
+
+        let auth = Authenticate {
+            username: Some(username),
+            password: Some(password),
+            ..Default::default()
+        };
 
         let session = authenticate(&self.conf, "password", Some(auth)).await?;
 
@@ -289,6 +298,7 @@ impl ZitiApi {
         Ok(())
     }
 
+    /// Gets a ziti box by id. The existence of the "ZitiBox" role is ensured.
     pub async fn get_ziti_box(&self, id: String) -> Result<IdentityDetail> {
         let identity = detail_identity(&self.conf, &id).await?.data;
         if let Some(roles) = &identity.role_attributes
@@ -302,6 +312,7 @@ impl ZitiApi {
         }
     }
 
+    /// This creates a ziti box with a
     pub async fn create_ziti_box(&self, name: String) -> Result<()> {
         create_identity(
             &self.conf,

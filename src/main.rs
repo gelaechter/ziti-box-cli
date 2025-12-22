@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod image;
+mod secrets;
 
 use std::path::PathBuf;
 
@@ -21,6 +22,7 @@ use ziti_api::models::{IdentityEnrollmentsOtt, identity_detail::EdgeRouterConnec
 use crate::{
     api::{CONFIG_PATH, EnrollmentState, ZitiApi},
     image::ZitiBoxImage,
+    secrets::{BasicKeystore, FreeDesktopKeystore},
 };
 
 // Define flags
@@ -28,6 +30,11 @@ use crate::{
 #[command(name = "Ziti Box utility cli")]
 #[clap(author, version, about)]
 struct Args {
+    /// Disables the use of a FreeDesktop Secret Service for environments where it is not available\
+    /// Your , PASSWORD and SESSION KEY will then be stored IN PLAINTEXT
+    #[arg(long)]
+    pub basic_keystore: bool,
+    /// Which action to execute
     #[clap(subcommand)]
     pub subcommand: SubCommands,
 }
@@ -75,6 +82,14 @@ async fn main() -> Result<()> {
 /// This starts the cli
 pub async fn cli() -> Result<()> {
     let args = Args::parse();
+
+    // Allow the user to disable using a FreeDesktop Secret Service
+    if args.basic_keystore  {
+        secrets::init_key_store(Box::new(BasicKeystore::new()));
+    } else {
+        secrets::init_key_store(Box::new(FreeDesktopKeystore::new()));
+    }
+
     match args.subcommand {
         SubCommands::Configure => cmd_first_time_configuration().await,
         SubCommands::List => cmd_list_ziti_boxes().await,
