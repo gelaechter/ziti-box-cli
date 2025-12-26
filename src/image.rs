@@ -1,10 +1,8 @@
-#![warn(clippy::pedantic)]
-#![warn(clippy::nursery)]
-
 use color_eyre::{
     Result,
     eyre::{self, Context, eyre},
 };
+use convert_case::ccase;
 use ext4_rs::{BLOCK_SIZE, BlockDevice, Ext4, InodeFileType};
 use gpt::partition_types::OperatingSystem::Linux;
 use gpt::partition_types::Type;
@@ -55,7 +53,7 @@ impl BlockDevice for DiskImage {
     }
 }
 
-/// Wrapper for an Ext4 that signifies this to be a ZitiBox image\
+/// Wrapper for an Ext4 that signifies this to be a Ziti Box image\
 pub struct ZitiBoxImage(Ext4);
 
 impl ZitiBoxImage {
@@ -113,38 +111,37 @@ impl ZitiBoxImage {
         // Write the entry into the file
         ext4.ext4_file_write(hosts_file.into(), 0, entry.as_bytes())
             .map_err(|e| eyre!("Couldn't write the hosts entry into the disk image:\n{e:#?}"))?;
-
         Ok(())
     }
 
-    /// This writes the hostname of the ZitiBox into the /etc/hostname file.\
+    /// This writes the hostname of the Ziti Box into the /etc/hostname file.\
     /// This is not required for OpenZiti but makes our underlying network less confusing.\
-    /// **The host parameter is trusted at this stage**, make sure you check it (regex or something)
     pub fn write_hostname(&self, hostname: String) -> Result<()> {
-        // let ext4 = &self.0;
+        let ext4 = &self.0;
 
-        // Get etc directory
-        // let path = "/etc/";
-        // let inode = ext4.ext4_dir_open(path).map_err(|e| {
-        //     eyre!(
-        //         "Couldn't find inode for the /etc/ inode
-        //     Ensure that the chosen image is a ZitiBox image: {e:#?}"
-        //     )
-        // })?;
+        // Open / create file
+        let hostname_file = ext4
+            .ext4_file_open("/etc/hostname", "w")
+            .map_err(|e| eyre!("Couldn't open /etc/hostname in the disk image:\n{e:#?}"))?;
 
-        // let hostname_file = ext4
-        //     .ext4_file_open("/etc/hostname", "w")
-        //     .map_err(|e| eyre!("Couldn't open /etc/hostname in the disk image:\n{e:#?}"))?;
+        // Sanitize hostname and convert to train case (https://docs.rs/convert_case/latest/convert_case/enum.Case.html#variant.Train)
+        let hostname = format!(
+            "ZBox-{}",
+            ccase!(
+                train,
+                hostname.chars().filter(char::is_ascii).collect::<String>()
+            )
+        );
 
-        // // Write the jwt into the file
-        // ext4.ext4_file_write(hostname_file.into(), 0, hostname.as_bytes())
-        //     .map_err(|e| eyre!("Couldn't write the hostname into the disk image:\n{e:#?}"))?;
+        // Write the hostname into the file
+        ext4.ext4_file_write(hostname_file.into(), 0, hostname.as_bytes())
+            .map_err(|e| eyre!("Couldn't write the hostname into the disk image:\n{e:#?}"))?;
 
         Ok(())
     }
 }
 
-/// Trys to initialize a ZitiBox from a file path
+/// Trys to initialize a Ziti Box from a file path
 impl TryFrom<PathBuf> for ZitiBoxImage {
     type Error = eyre::Report;
 

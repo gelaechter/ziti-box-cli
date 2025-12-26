@@ -125,11 +125,10 @@ impl ZitiApi {
                         let session = api.reauth().await?;
                         api.session_expiration = session.expires_at;
 
+                        // TODO: This module should act like a library and not output things; REFACTOR
                         let msg =
-                            format!("Successfully reauthenticated as {}", api.username.clone())
-                                .info()
-                                .to_string();
-                        println!("{}", msg);
+                            format!("Successfully reauthenticated as {}", api.username.clone());
+                        println!("{}", msg.info());
 
                         // Save session token and return it
                         secrets::key_store()
@@ -287,6 +286,8 @@ impl ZitiApi {
         ziti_api::apis::enrollment_api::create_enrollment(
             &self.conf,
             EnrollmentCreate {
+                // FIXME: This results in a 180 minute enrollment time in CET (UTC +1)
+                // Does OpenZiti not actually default to UTC for enrollments?
                 expires_at: (Utc::now() + Duration::minutes(30)).to_rfc3339(),
                 identity_id: zitibox.id,
                 method: Method::Ott,
@@ -341,6 +342,7 @@ impl ZitiApi {
         Ok(())
     }
 
+    /// TODO: implement this to allow us to communicate over the OpenZiti network for ssh-ing into the ZitiBox
     pub async fn bootstrap_ziti_network(&self) -> Result<()> {
         // Heres the plan
         // 1. Check if a ZitiBoxCli identity already exists

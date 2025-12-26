@@ -1,3 +1,8 @@
+//! Contains the logic for secrest management. This currently includes the account password and the session token.
+//! 
+//! This module allows storing 
+//! 
+
 use color_eyre::eyre::{Context, Result, eyre};
 use keyring::KeyringEntry;
 use std::{
