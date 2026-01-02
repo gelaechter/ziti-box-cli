@@ -59,7 +59,7 @@ pub struct ZitiBoxImage(Ext4);
 impl ZitiBoxImage {
     /// This creates a JWT file inside the /opt/openziti/etc/identities\
     /// The jwt parameter is written as the content of the file
-    pub fn write_ziti_jwt(&self, jwt: String) -> Result<()> {
+    pub fn write_ziti_jwt(&self, jwt: &str) -> Result<()> {
         let ext4 = &self.0;
 
         // Get identity directory
@@ -97,7 +97,7 @@ impl ZitiBoxImage {
     /// This writes an entry into /etc/hosts\
     /// This may be needed for when our controller isn't publicly available.\
     /// **The host parameter is trusted at this stage**, make sure you check it (regex or something)
-    pub fn write_hosts_entry(&self, ip: IpAddr, host: String) -> Result<()> {
+    pub fn write_hosts_entry(&self, ip: IpAddr, host: &str) -> Result<()> {
         let ext4 = &self.0;
 
         // Open the file in append mode (O_APPEND: https://man7.org/linux/man-pages/man2/open.2.html)
@@ -116,7 +116,7 @@ impl ZitiBoxImage {
 
     /// This writes the hostname of the Ziti Box into the /etc/hostname file.\
     /// This is not required for OpenZiti but makes our underlying network less confusing.\
-    pub fn write_hostname(&self, hostname: String) -> Result<()> {
+    pub fn write_hostname(&self, hostname: &str) -> Result<()> {
         let ext4 = &self.0;
 
         // Open / create file
@@ -139,6 +139,16 @@ impl ZitiBoxImage {
 
         Ok(())
     }
+
+    /// Writes two ssh keys for tcpdump and zfw respectively into /home/ziticli/.ssh/authorized_keys
+    /// This allows to connect to the zitibox using ssh and checking requests on enp1s0
+    /// It also allows us to check applied 
+    pub fn write_ssh_keys(&self) -> Result<()> {
+        todo!("
+        Write any ssh keys onto their respective line
+        Be aware that the line will already contain a `command=` directive for the keys command
+        ")
+    }
 }
 
 /// Trys to initialize a Ziti Box from a file path
@@ -158,10 +168,10 @@ impl TryFrom<PathBuf> for ZitiBoxImage {
             // Open the first partition as an ext4 block device
             let disk = Arc::new(DiskImage {
                 path,
-                partition_offset: partition.first_lba as usize,
+                partition_offset: usize::try_from(partition.first_lba).wrap_err("First logical block address doesn't fit into a pointer. Is this a 32-Bit system?")?,
             });
             let ext4 = Ext4::open(disk);
-            Ok(ZitiBoxImage(ext4))
+            Ok(Self(ext4))
         } else {
             Err(eyre!(
                 "First partition in image does not contain an EXT4 Linux host"

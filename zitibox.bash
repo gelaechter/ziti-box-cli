@@ -1,5 +1,6 @@
-#!bin/bash
-set -e
+#!/usr/bin/env bash
+
+set -euxo pipefail
 
 # Root required
 if [ "$EUID" -ne 0 ]; then
@@ -8,11 +9,20 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Try installing
-ls *.jwt || { echo "No .jwt files found. Make sure to place it in this directory."; exit 1; }
+ls ./*.jwt || { echo "No .jwt files found. Make sure to place it in this directory."; exit 1; }
+
+# Configure wireshark installation settings using debconf
+echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
+
+# Add ZET keyring
+curl -sSLf https://get.openziti.io/tun/package-repos.gpg | gpg --dearmor --output /usr/share/keyrings/openziti.gpg
+chmod a+r /usr/share/keyrings/openziti.gpg
+echo "deb [signed-by=/usr/share/keyrings/openziti.gpg] https://packages.openziti.org/zitipax-openziti-deb-stable jammy main" \
+> /etc/apt/sources.list.d/openziti.list
 
 # Install required software
 apt update
-apt install --assume-yes tmux micro tcpdump isc-dhcp-server dnsutils
+apt install --assume-yes ziti-edge-tunnel=1.7.12 isc-dhcp-server tcpdump tshark micro tmux
 
 # Add our controller to /etc/hosts
 cat <<"EOF" >> /etc/hosts
@@ -21,10 +31,8 @@ cat <<"EOF" >> /etc/hosts
 192.168.178.49 ziti.pommer.info
 EOF
 
-# Install tunnel
-curl -sSLf https://get.openziti.io/tun/scripts/install-ubuntu.bash | bash
 # Copy .jwt
-cp *.jwt /opt/openziti/etc/identities/
+cp ./*.jwt /opt/openziti/etc/identities/
 sudo chown -cR :ziti        /opt/openziti/etc/identities
 sudo chmod -cR ug=rwX,o-rwx /opt/openziti/etc/identities
 # Activate Tunnel:
@@ -92,3 +100,15 @@ EOF
 # Disable DHCPD for IPv6
 systemctl disable isc-dhcp-server6
 systemctl start isc-dhcp-server
+
+# Create a ziticli user for capturing traffic on the Ziti Box
+useradd ziticli
+mkdir -p /home/ziticli/.ssh/
+chown -R ziticli:ziticli /home/ziticli/
+touch /home/ziticli/.ssh/authorized_keys
+
+# Create a pcap group and add ziticli to it
+groupadd pcap
+usermod -a -G pcap ziticli
+chgrp pcap /usr/bin/tcpdump
+setcap cap_net_raw,cap_net_admin=eip /usr/bin/tcpdump

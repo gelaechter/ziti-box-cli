@@ -1,3 +1,4 @@
+# shellcheck disable=SC2148
 # Build the image for the FriendlyElec NanoPi R3S-LTS Board
 export BOARD="nanopi-r3s-lts"
 # Use the current branch of armbian
