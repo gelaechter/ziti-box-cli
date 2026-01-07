@@ -1,9 +1,15 @@
 //! This module contains the russh logic that lets us use SSH over OpenZiti using the ziti-sdk crate
-//!
-//! The idea is as follows:
-//! For every command we want to execute remotely on the Ziti Box (wireshark and zfw) we generate one keypair
-//! Then we generate and additional keypair that serves as the hosts public key ()
 //! 
+//! ***
+//! 
+//! # The Idea
+//! 1. We want to execute commands on the Ziti Box remotely; These include for example:
+//!     - wireshark (this allows us to query requests on the LAN interface allowing us to whitelist them)
+//!     - zfw (this allows us to view effective rules, this is more reliable than trying to guess these based on services)
+//!     - anything else (this might be e.g. systemctl or journalctl for health checks)
+//! 2. To do this we leverage ziti-sdk crate; It allows us to connect to the OpenZiti network from our Rust code.
+//!    ziti-sdk will give us a stream that implemens AsyncWrite and AsyncRead
+//! 3. We then use russh to use this low level stream to execute our commands over the OpenZiti network
 
 use color_eyre::eyre::{Result, bail};
 use russh::{

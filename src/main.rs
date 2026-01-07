@@ -1,6 +1,11 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 #![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+
+//! This main module contains the CLI logic
+//!
+//! In theory this module should be completely replaceable by any other interface should a CLI not be enough
 
 mod api;
 mod config;
@@ -16,16 +21,21 @@ use color_eyre::{
     owo_colors::OwoColorize,
 };
 use comfy_table::Table;
+use convert_case::ccase;
 use dialoguer::{Confirm, Input, Password, Select};
 use glob::glob;
-use owo_colors::{FgColorDisplay, SupportsColorsDisplay, colors::{BrightRed, Cyan, Green}};
+use owo_colors::{
+    FgColorDisplay, SupportsColorsDisplay,
+    colors::{BrightRed, Cyan, Green},
+};
 use reqwest::Url;
 use std::{fs, net::IpAddr, path::PathBuf, str::FromStr};
 use ziti_api::models::{IdentityEnrollmentsOtt, identity_detail::EdgeRouterConnectionStatus};
 
 use crate::{
     api::{CONFIG_PATH, EnrollmentState, Port, ZitiApi, ZitiApiError, ZitiConfig},
-    image::ZitiBoxImage, secrets::KeyStore,
+    image::ZitiBoxImage,
+    secrets::KeyStore,
 };
 
 // Define flags
@@ -34,10 +44,10 @@ use crate::{
 #[clap(author, version, about)]
 struct Args {
     /// Disables the FreeDesktop Secret Service; Your password will be stored STORED IN PLAINTEXT
-    /// 
+    ///
     /// This option stores your password and session key in plaintext
     /// It exists for environments where no FreeDesktop Secret Service is available.
-    /// Only activate this if there is no way to install a provider like GNOME Keyring or KDE Wallet 
+    /// Only activate this if there is no way to install a provider like GNOME Keyring or KDE Wallet
     #[arg(long)]
     pub basic_keystore: bool,
     /// Which action to execute
@@ -76,31 +86,31 @@ enum SubCommands {
         /// The entry has the format "ip:host", e.g. "192.168.175.3:ziti.box"
         /// This is useful if your controller is not hosted publicly but still requires a hostname
         #[arg(long, value_parser = parse_host_entry)]
-        host_entry: Option<HostsEntry>,
+        hosts_entry: Option<HostsEntry>,
     },
     /// Irreversibly deletes a Ziti Box identity
     Delete {
         #[arg()]
         ziti_box_id: String,
     },
-    /// Whitelists an internet address and ports 
+    /// Whitelists an internet address and ports
     Whitelist {
         /// The id of the Ziti Box for which to whitelist the address
         #[arg()]
         ziti_box_id: String,
         /// The address to whitelist
-        /// 
+        ///
         /// This address supports wildcards, e.g. *.google.com
         #[arg(long_help)]
         address: String,
         /// The ports for which the whitelist counts
-        /// 
+        ///
         /// Multiple ports can be entered sepearted by a space (80 433)
         /// Port ranges can be defined using a minus (1000-1005)
         /// This syntax can be used together
         #[arg(num_args = 1.., required = true, value_name = "PORT(S)", value_parser = parse_port)]
-        ports: Vec<Port>
-    }
+        ports: Vec<Port>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +118,6 @@ struct HostsEntry {
     ip: IpAddr,
     host: String,
 }
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -136,31 +145,37 @@ pub async fn cli() -> Result<()> {
         SubCommands::Image {
             ziti_box_id,
             path,
-            host_entry,
-        } => cmd_create_img(ziti_box_id, path, host_entry).await,
+            hosts_entry,
+        } => cmd_image(ziti_box_id, path, hosts_entry).await,
         SubCommands::ReEnroll { ziti_box_id } => cmd_re_enroll_ziti_box(ziti_box_id).await,
         SubCommands::Create { name } => cmd_create_ziti_box(name).await,
         SubCommands::Delete { ziti_box_id } => cmd_delete_ziti_box(ziti_box_id).await,
-        SubCommands::Whitelist { ziti_box_id, address, ports } => cmd_whitelist_address(ziti_box_id, address, ports).await,
+        SubCommands::Whitelist {
+            ziti_box_id,
+            address,
+            ports,
+        } => cmd_whitelist_address(ziti_box_id, address, ports).await,
     }
 }
 
 /// Either loads the existing ZitiApi or starts first time configuration
 async fn construct_ziti_api() -> Result<ZitiApi> {
     // Try loading ZitiConfig
-    let ziti_conf = ZitiConfig::load().await.wrap_err(eyre!("Error while trying to load config at {}", CONFIG_PATH.display()))?;
-    
+    let ziti_conf = ZitiConfig::load().await.wrap_err(eyre!(
+        "Error while trying to load config at {}",
+        CONFIG_PATH.display()
+    ))?;
+
     // If it doesnt exist run first time configuration instead
-    let ziti_conf = match ziti_conf {
-        Some(conf) => conf,
-        None => {
-            println!("{}", "It seems Ziti Box CLI has not been configured yet. Starting first time configuration...".info());
-            return first_time_configuration().await; // early return
-        },
+    let Some(ziti_conf) = ziti_conf else {
+        println!("{}", "It seems Ziti Box CLI has not been configured yet. Starting first time configuration...".info());
+        return first_time_configuration().await; // early return
     };
 
     // If it does then check if we have a valid session token
-    let ziti_api = ZitiApi::try_from_session(&ziti_conf).await.wrap_err("Error while trying to reuse OpenZiti session")?;
+    let ziti_api = ZitiApi::try_from_session(&ziti_conf)
+        .await
+        .wrap_err("Error while trying to reuse OpenZiti session")?;
 
     // If we do use that
     if let Some(api) = ziti_api {
@@ -168,18 +183,24 @@ async fn construct_ziti_api() -> Result<ZitiApi> {
     }
 
     // Otherwise prompt the user to authenticate again
-    let mut prompt = format!("The OpenZiti Session is not valid anymore, please re-enter your password for user {}", &ziti_conf.username).info().to_string();
+    let mut prompt = format!(
+        "The OpenZiti Session is not valid anymore, please re-enter your password for user {}",
+        &ziti_conf.username
+    )
+    .info()
+    .to_string();
 
     let ziti_api = loop {
-
         let password = dialoguer::Password::new().with_prompt(prompt).interact()?;
 
         match ZitiApi::authenticate(&ziti_conf, password).await {
             Ok(api) => break api,
             Err(ZitiApiError::IncorrectCredentials) => {
-                prompt = "The entered credentials are incorrect, please retry".alert().to_string()
-            },
-            Err(e) => return Err(e).context("Error during authentication")
+                prompt = "The entered credentials are incorrect, please retry"
+                    .alert()
+                    .to_string();
+            }
+            Err(e) => return Err(e).context("Error during authentication"),
         }
     };
 
@@ -205,10 +226,9 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
 
     // Build a table from our identities
     let mut table = Table::new();
-    table.set_header(vec!["Id", "Status", "Name", "Enrollment", "Services"]);
+    table.set_header(vec!["Id", "Status", "Name", "Enrollment"]);
 
     for zitibox in identities {
-        
         // FIXME: Currently doesn't work because of: https://openziti.discourse.group/t/openapi-spec-mismatch-servicedetail-config-nullability/5457
         // let services = ziti_api.list_identity_services(&zitibox.id)
         //     .await?
@@ -222,7 +242,7 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
             match &zitibox.edge_router_connection_status {
                 EdgeRouterConnectionStatus::Online => "Online".success().to_string(),
                 EdgeRouterConnectionStatus::Offline => "Offline".alert().to_string(),
-                EdgeRouterConnectionStatus::Unknown => "Unknown".yellow().to_string(),
+                EdgeRouterConnectionStatus::Unknown => "Unknown".info().to_string(),
             },
             zitibox.name,
             match EnrollmentState::from(&*zitibox.enrollment) {
@@ -236,14 +256,15 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
 
                     let expiration = pretty_expiration(&ott);
 
-                    match expiration {
-                        Some(expires) => format!("Ready to enroll ({expires})"),
-                        None => "Ready to enroll".to_string(),
-                    }
-                    .bright_blue()
-                    .to_string()
+                    expiration
+                        .map_or_else(
+                            || "Ready to enroll".to_string(),
+                            |expires| format!("Ready to enroll ({expires})"),
+                        )
+                        .bright_blue()
+                        .to_string()
                 }
-                EnrollmentState::Unknown => "Unknown enrollment state".yellow().to_string(),
+                EnrollmentState::Unknown => "Unknown enrollment state".info().to_string(),
             },
             // services
         ]);
@@ -254,30 +275,34 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
 }
 
 /// Creates a disk image for a Ziti Box identity
-async fn cmd_create_img(
+async fn cmd_image(
     ziti_box_id: String,
     path: Option<PathBuf>,
     host_entry: Option<HostsEntry>,
 ) -> Result<()> {
-    let ziti_box = construct_ziti_api()
-        .await?
-        .get_ziti_box(ziti_box_id.clone())
-        .await?;
+    let ziti_api = construct_ziti_api().await?;
+    let mut ziti_box = ziti_api.get_ziti_box(ziti_box_id.clone()).await?;
 
     // Check if the ZitiBox is ready to enroll
     if !matches!(
         EnrollmentState::from(&*ziti_box.enrollment),
         EnrollmentState::ReadyToEnroll
     ) {
-        // If it isn't then offer to reset enrollment
-        println!("{}", "This ZitiBox is not ready to be enrolled".alert());
-        let reenroll = Confirm::new()
-            .with_prompt("Do you want to re-enroll the Ziti Box?".info().to_string())
-            .interact()
-            .unwrap();
-
-        if reenroll {
-            cmd_re_enroll_ziti_box(ziti_box_id).await?;
+        if Confirm::new() // If it isn't then offer to reset enrollment
+            .with_prompt(
+                "This ZitiBox is not ready to be enrolled.\n\
+                Do you want to re-enroll the Ziti Box?"
+                    .info()
+                    .to_string(),
+            )
+            .interact()?
+        {
+            // Re-enroll it, then fetch the new enrollment
+            ziti_api.reset_enrollment(ziti_box_id.clone()).await?;
+            ziti_box = ziti_api.get_ziti_box(ziti_box_id).await?;
+        } else {
+            // Otherwise abort
+            return Ok(());
         }
     }
 
@@ -306,8 +331,7 @@ async fn cmd_create_img(
         // If not offer to create one
         println!(
             "{}",
-            
-                "No image backup found. Ziti Box CLI changes images in place, keeping one clean copy in case of write errors is recommended.".info()
+            "No image backup found. Ziti Box CLI changes images in place, keeping one clean copy in case of write errors is recommended.".info()
         );
         let copy = Confirm::new()
             .with_prompt("Create a backup now?".info().to_string())
@@ -327,16 +351,29 @@ async fn cmd_create_img(
     let image = ZitiBoxImage::try_from(img_path)
         .wrap_err("The selected disk image is not a valid Ziti Box image")?;
 
-    // Write JWT, Hostname and optionally a host entry
+    // Write JWT
     image.write_ziti_jwt(&jwt)?;
-    image.write_hostname(&ziti_box.id)?;
-    if let Some(host_entry) = host_entry {
-        image.write_hosts_entry(host_entry.ip, &host_entry.host)?;
+
+    // Sanitize hostname and convert to train case (https://docs.rs/convert_case/latest/convert_case/enum.Case.html#variant.Train)
+    let hostname = format!(
+        "ZBox-{}",
+        ccase!(
+            train,
+            &ziti_box.name.chars().filter(char::is_ascii).collect::<String>()
+        )
+    );
+
+    // Write Hostname
+    image.write_hostname(&hostname)?;
+
+    // Write Hosts entry
+    if let Some(hosts_entry) = host_entry {
+        image.write_hosts_entry(hosts_entry.ip, &hosts_entry.host)?;
     }
 
     println!(
         "{}",
-        "Successfully overwrote wrote identity into disk image".success()
+        "Successfully overwrote identity in the disk image".success()
     );
 
     Ok(())
@@ -367,22 +404,31 @@ pub async fn first_time_configuration() -> Result<ZitiApi> {
                 break;
             }
             Err(ZitiApiError::SelfSignedTLS) => {
-                println!("{}", "The controller certificate seems to be self-signed.".alert());
+                println!(
+                    "{}",
+                    "The controller certificate seems to be self-signed.".alert()
+                );
 
                 // Ask user to allow bad tls
                 accept_bad_tls = Confirm::new()
-                    .with_prompt("Accept invalid TLS certs? Only allow this if you self signed your certs.".alert().to_string())
+                    .with_prompt(
+                        "Accept invalid TLS certs? Only allow this if you self signed your certs."
+                            .alert()
+                            .to_string(),
+                    )
                     .interact()?;
             }
 
             // If this is a generic error then just error out
-            Err(e) => {
-                return Err(e).context("Cannot connect to endpoint, is the URL correct?")
-            }
+            Err(e) => return Err(e).context("Cannot connect to endpoint, is the URL correct?"),
         }
     }
 
-    let mut ziti_conf =  ZitiConfig { url, accept_bad_tls, username: String::new() };
+    let mut ziti_conf = ZitiConfig {
+        url,
+        accept_bad_tls,
+        username: String::new(),
+    };
     let mut password = String::new();
 
     // Keep prompting username / password until the correct credentials are entered
@@ -392,21 +438,35 @@ pub async fn first_time_configuration() -> Result<ZitiApi> {
             .with_initial_text(ziti_conf.username.clone()); // Prefill username if already tried once
 
         ziti_conf.username = username_prompt.interact_text()?;
-        password = Password::new().with_prompt("Enter password".info().to_string()).interact()?;
+        password = Password::new()
+            .with_prompt("Enter password".info().to_string())
+            .interact()?;
 
         match ZitiApi::authenticate(&ziti_conf, password).await {
             Ok(api) => break api,
-            Err(ZitiApiError::IncorrectCredentials) => println!("{}", "Incorrect credentials, please retry".alert()),
+            Err(ZitiApiError::IncorrectCredentials) => {
+                println!("{}", "Incorrect credentials, please retry".alert());
+            }
             Err(e) => return Err(e).context("Error while trying to authenticate"),
-        };
+        }
     };
 
-    ziti_conf.save();
-    ziti_api.store_session_token();
+    ziti_conf
+        .save()
+        .await
+        .wrap_err("Couldn't save the configuration")?;
+    ziti_api
+        .store_session_token()
+        .await
+        .wrap_err("Couldn't save session token to key store")?;
+
+    println!(
+        "{}",
+        "Successfully configured; Saved configuration and token.".success()
+    );
 
     Ok(ziti_api)
 }
-
 
 pub async fn cmd_re_enroll_ziti_box(ziti_box_id: String) -> Result<()> {
     let ziti_api = construct_ziti_api().await?;
@@ -416,9 +476,9 @@ pub async fn cmd_re_enroll_ziti_box(ziti_box_id: String) -> Result<()> {
     if matches!(
         EnrollmentState::from(&*ziti_box.enrollment),
         EnrollmentState::Enrolled
-    ) && !Confirm::new()
+    ) && !Confirm::new() // Warn before re-enrolling an enrolled identity
         .with_prompt(
-            "Are you sure you want to reset the enrollment for this Ziti Box? 
+            "Are you sure you want to reset the enrollment for this Ziti Box?\n\
             You will have to reflash the image!"
                 .alert()
                 .to_string(),
@@ -468,7 +528,9 @@ async fn cmd_delete_ziti_box(
     let prompt = format!(
         "Are you sure you want to delete Ziti Box \"{}\"? Retype the name to confirm:",
         ziti_box.name
-    ).alert().to_string();
+    )
+    .alert()
+    .to_string();
 
     let input: String = Input::new().with_prompt(prompt).interact_text()?;
 
@@ -482,24 +544,38 @@ async fn cmd_delete_ziti_box(
     Ok(())
 }
 
-async fn cmd_whitelist_address(ziti_box_id: String, address: String, ports: Vec<Port>) -> Result<()> {
+async fn cmd_whitelist_address(
+    ziti_box_id: String,
+    address: String,
+    ports: Vec<Port>,
+) -> Result<()> {
     let ziti_api = construct_ziti_api().await?;
     let edge_routers = ziti_api.list_edge_routers().await?;
-    
+
     // If there is more than one edge router make the user choose one
     let edge_router = match edge_routers.len() {
-        0 => return Err(eyre!("No edge routers found to which the traffic could be routed".alert())),
+        0 => {
+            return Err(eyre!(
+                "No edge routers found to which the traffic could be routed".alert()
+            ));
+        }
         1 => edge_routers.first().expect("Guaranteed through len=1"),
         2.. => {
             let answer = Select::new()
                 .with_prompt("Found multiple edge routers, choose one".info().to_string())
-                .items(edge_routers.iter().map(|id| format!("{} ({})", id.name, id.id)))
+                .items(
+                    edge_routers
+                        .iter()
+                        .map(|id| format!("{} ({})", id.name, id.id)),
+                )
                 .interact()?;
             &edge_routers[answer]
         }
     };
 
-    ziti_api.create_edge_service(ziti_box_id, address, ports, edge_router).await?;
+    ziti_api
+        .create_edge_service(ziti_box_id, address, ports, edge_router)
+        .await?;
 
     println!("{}", "Successfully created new edge service".success());
 
@@ -518,13 +594,17 @@ async fn cmd_monitor_ziti_box(ziti_box_id: String) -> Result<()> {
 /// TODO: The types used here are a crime but i can't be bothered to alias them right now
 pub trait TextColors: Sized {
     /// Colors anything that supports displaying (is sized)
-    fn alert<'a>(&'a self) -> SupportsColorsDisplay<
+    fn alert<'a>(
+        &'a self,
+    ) -> SupportsColorsDisplay<
         'a,
         Self,
         FgColorDisplay<'a, BrightRed, Self>,
         impl Fn(&'a Self) -> FgColorDisplay<'a, BrightRed, Self> + 'a,
     > {
-        self.if_supports_color(owo_colors::Stream::Stdout, |text: &'a Self| text.bright_red())
+        self.if_supports_color(owo_colors::Stream::Stdout, |text: &'a Self| {
+            text.bright_red()
+        })
     }
 
     fn info<'a>(
@@ -570,21 +650,30 @@ fn parse_host_entry(s: &str) -> Result<HostsEntry, String> {
 
 fn parse_port(s: &str) -> Result<Port, String> {
     // Split at minus for ranges
-    let ports:  Vec<&str> = s.split('-').collect(); 
+    let ports: Vec<&str> = s.split('-').collect();
     match ports.len() {
-        1 => { // No range (Port)
+        1 => {
+            // No range (Port)
             let port_str = ports[0];
-            let port = port_str.parse::<u16>().map_err(|_e| format!("\"{port_str}\" is not a valid port"))?;
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|_e| format!("\"{port_str}\" is not a valid port"))?;
             Ok(Port::Single(port))
         }
-        2 => { // Range (PortA-PortB)
+        2 => {
+            // Range (PortA-PortB)
             let start_str = ports[0];
             let end_str: &str = ports[1];
-            let strart_port = start_str.parse::<u16>().map_err(|_e| format!("\"{start_str}\" is not a valid port"))?;
-            let end_port = end_str.parse::<u16>().map_err(|_e| format!("\"{end_str}\" is not a valid port"))?;
+            let strart_port = start_str
+                .parse::<u16>()
+                .map_err(|_e| format!("\"{start_str}\" is not a valid port"))?;
+            let end_port = end_str
+                .parse::<u16>()
+                .map_err(|_e| format!("\"{end_str}\" is not a valid port"))?;
             Ok(Port::Range(strart_port, end_port))
         }
-        _ => { // Something else entirely
+        _ => {
+            // Something else entirely
             Err("malformed port entry; refer to the help section".to_string())
         }
     }
@@ -611,6 +700,7 @@ pub fn pretty_expiration(ott: &IdentityEnrollmentsOtt) -> Option<String> {
         })
 }
 
+#[allow(clippy::missing_panics_doc)] // I don't know why clippy complains here
 pub fn choose_image() -> Result<Option<PathBuf>> {
     // Directories we want to search with a *.img globbing pattern
     let home_dir = dirs_next::home_dir().ok_or_else(
@@ -619,12 +709,7 @@ pub fn choose_image() -> Result<Option<PathBuf>> {
         .join("*.img")
         .into_os_string()
         .into_string()
-        .map_err(|os| {
-            eyre!(
-                "Couldn't convert OsString of globbing path into String:\n{:?}",
-                os
-            )
-        })?;
+        .map_err(|os| eyre!("Couldn't convert OsString of globbing path into String:\n{os:?}"))?;
 
     // Collect globbed results
     let paths: Vec<PathBuf> = glob(&glob_path)
@@ -635,7 +720,11 @@ pub fn choose_image() -> Result<Option<PathBuf>> {
     let path = match paths.len() {
         0 => None,
         1 => {
-            println!("Using only disk image {}", paths.first().expect("Guaranteed by len=1 match").display());
+            let message = format!(
+                "Using disk image {}",
+                paths.first().expect("Guaranteed by len=1 match").display()
+            );
+            println!("{}", message.info());
             Some(paths.first().expect("Guaranteed through len == 1 check"))
         }
         2.. => {

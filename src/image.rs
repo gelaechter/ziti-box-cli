@@ -1,9 +1,13 @@
+//! This module contains all the logic to write data to a Ziti Box Disk Image
+//!
+//! To do this we read the raw data in the disk image using the filesystem and treat it as a block device
+//! This way image modificatoin should be OS agnostic and be possible without root/administrator priviledges since we're not actually mounting anything.
+
 use color_eyre::{
     Result,
     eyre::{self, Context, eyre},
 };
-use convert_case::ccase;
-use ext4_rs::{BLOCK_SIZE, BlockDevice, Ext4, InodeFileType};
+use ext4_rs::{BLOCK_SIZE, BlockDevice, Errno, Ext4, InodeFileType};
 use gpt::partition_types::OperatingSystem::Linux;
 use gpt::partition_types::Type;
 use std::fs::OpenOptions;
@@ -11,9 +15,6 @@ use std::io::{Read, Seek, Write};
 use std::{net::IpAddr, path::PathBuf, sync::Arc};
 
 const SECTOR_SIZE: usize = 512;
-/// See [`ext4_rs::ext4_defs::direntry::DirEntryType::EXT4_DE_REG_FILE`]\
-/// This module is sadly private
-const EXT4_DE_REG_FILE: u8 = 1;
 
 #[derive(Debug)]
 pub struct DiskImage {
@@ -56,40 +57,110 @@ impl BlockDevice for DiskImage {
 /// Wrapper for an Ext4 that signifies this to be a Ziti Box image\
 pub struct ZitiBoxImage(Ext4);
 
+/// Inode Newtype
+struct Inode(u32);
+
 impl ZitiBoxImage {
+    /// Will either open or create the file at path (path from root)
+    /// Returns the inode of this file
+    fn open_file(&self, path: &str) -> Result<Inode> {
+        let mut root_inode = 2;
+        let inode_mode = InodeFileType::S_IFREG.bits();
+        let file_inode = &self
+            .0
+            .generic_open(path, &mut root_inode, true, inode_mode, &mut 0)
+            .map_err(|e| eyre!("Couldn't get/create identity file inode:\n{e:#?}"))?;
+
+        Ok(Inode(*file_inode))
+    }
+
+    fn write_file(&self, inode: &Inode, data: &impl ToString) -> Result<()> {
+        self.write_file_offset(inode, 0, data)
+    }
+
+    /// Writes into a file
+    fn write_file_offset(&self, inode: &Inode, offset: usize, data: &impl ToString) -> Result<()> {
+        let binding = data.to_string();
+        let data = binding.as_bytes();
+        let bytes_written = self
+            .0
+            .write_at(inode.0, offset, data)
+            .map_err(|e| eyre!("Couldn't write into the disk image:\n{e:#?}"))?;
+
+        let data_len = data.len();
+        if bytes_written != data_len {
+            return Err(eyre!(
+                "Didn't write all of the provided data! Wrote {bytes_written} of {data_len} bytes."
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Reads an entire file and returns the contents
+    fn read_file(&self, inode: &Inode) -> Result<Vec<u8>> {
+        let ext4 = &self.0;
+
+        let inode_ref = ext4.get_inode_ref(inode.0);
+        let file_bytes = usize::try_from(inode_ref.inode.size()).wrap_err(
+            "Couldn't create a buffer large enough for file size. Is this a 32-Bit system?",
+        )?;
+        let mut read_buffer = vec![0u8; file_bytes];
+
+        let bytes_read = ext4
+            .read_at(inode.0, 0, &mut read_buffer)
+            .map_err(|e| eyre!("Couldn't write into the disk image:\n{e:#?}"))?;
+
+        if bytes_read != file_bytes {
+            return Err(eyre!(
+                "Didn't read all of the files data! Read {bytes_read} of {file_bytes} bytes."
+            ));
+        }
+
+        Ok(read_buffer)
+    }
+
+    /// Checks if a file exists
+    fn file_exists(&self, path: &str) -> Result<bool> {
+        let mut root_inode = 2;
+        let inode_mode = InodeFileType::S_IFREG.bits();
+        let file_inode = self
+            .0
+            .generic_open(path, &mut root_inode, false, inode_mode, &mut 0);
+
+        match file_inode {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.error() == Errno::ENOENT {
+                    Ok(false)
+                } else {
+                    Err(eyre!("Couldn't check if file exists"))
+                }
+            }
+        }
+    }
+
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.0
+            .file_remove(path)
+            .map_err(|_| eyre!("Couldn't remove error"))
+            .and_then(|r| {
+                if r == 0 {
+                    Ok(())
+                } else {
+                    Err(eyre!("Couldn't remove error"))
+                }
+            })
+    }
+
     /// This creates a JWT file inside the /opt/openziti/etc/identities\
     /// The jwt parameter is written as the content of the file
     pub fn write_ziti_jwt(&self, jwt: &str) -> Result<()> {
-        let ext4 = &self.0;
-
-        // Get identity directory
-        let path = "/opt/openziti/etc/identities/";
-        let inode = ext4.ext4_dir_open(path).map_err(|e| {
-            eyre!(
-                "Couldn't find inode for Ziti identity directory opt/openziti/etc/identities/
-            Ensure that the chosen image is a ZitiBox image: {e:#?}"
-            )
-        })?;
-
-        // Remove old files from identity directory
-        for entry in ext4.ext4_dir_get_entries(inode) {
-            if entry.get_de_type() == EXT4_DE_REG_FILE {
-                ext4.file_remove(&format!("{}{}", path, entry.get_name()))
-                    .map_err(|e| {
-                        eyre!("Can't remove old files in the Ziti identitiy directory:\n{e:#?}")
-                    })?;
-            }
-        }
-
-        // Create identity file
-        let inode_mode = InodeFileType::S_IFREG.bits(); // Inode File REGular
-        let jwt_file = ext4
-            .create(inode, "identity.jwt", inode_mode)
-            .map_err(|e| eyre!("Couldn't create identity file:\n{e:#?}"))?;
+        let path = "/opt/openziti/etc/identities/identity.jwt";
 
         // Write the jwt into the file
-        ext4.ext4_file_write(jwt_file.inode_num.into(), 0, jwt.as_bytes())
-            .map_err(|e| eyre!("Couldn't write jwt into the disk image:\n{e:#?}"))?;
+        let jwt_inode = self.open_file(path)?;
+        self.write_file(&jwt_inode, &jwt.to_owned())?;
 
         Ok(())
     }
@@ -98,56 +169,66 @@ impl ZitiBoxImage {
     /// This may be needed for when our controller isn't publicly available.\
     /// **The host parameter is trusted at this stage**, make sure you check it (regex or something)
     pub fn write_hosts_entry(&self, ip: IpAddr, host: &str) -> Result<()> {
-        let ext4 = &self.0;
+        let hosts_path = "/etc/hosts";
+        let backup_path = "/etc/hosts.bak";
 
-        // Open the file in append mode (O_APPEND: https://man7.org/linux/man-pages/man2/open.2.html)
-        let hosts_file = ext4
-            .ext4_file_open("/etc/hosts", "a")
-            .map_err(|e| eyre!("Couldn't open /etc/hosts in the disk image:\n{e:#?}"))?;
+        // We might have to recover a backup if we want to start from a clean state
+        // this is because we change the image in place and not copy it
+        // Otherwise we would accumulate more and more hosts entries which we don't want
+        let (hosts_file, hosts_contents) = if self.file_exists(backup_path)? {
+            // If a backup exists restore that
+            self.remove_file(hosts_path)?;
+            let backup = self.open_file(backup_path)?;
+            let contents = String::from_utf8(self.read_file(&backup)?)?;
 
-        // The hosts entry should be on the next line
-        let entry = format!("\n{ip} {host}");
+            let hosts_file = self.open_file(hosts_path)?;
+            self.write_file(&hosts_file, &contents)?;
 
-        // Write the entry into the file
-        ext4.ext4_file_write(hosts_file.into(), 0, entry.as_bytes())
-            .map_err(|e| eyre!("Couldn't write the hosts entry into the disk image:\n{e:#?}"))?;
+            (hosts_file, contents) // return the created hosts file and its contents
+        } else {
+            // If no backup exists create one
+            let hosts_file = self.open_file(hosts_path)?;
+            let contents = String::from_utf8(self.read_file(&hosts_file)?)?;
+
+            let backup = self.open_file(backup_path)?;
+            self.write_file(&backup, &contents)?;
+
+            (hosts_file, contents) // return the original hosts file and its contens
+        };
+
+        let entry = format!("\n# Ziti Box CLI\n{ip} {host}");
+        self.write_file_offset(&hosts_file, hosts_contents.len(), &entry)?;
+
         Ok(())
     }
 
     /// This writes the hostname of the Ziti Box into the /etc/hostname file.\
     /// This is not required for OpenZiti but makes our underlying network less confusing.\
     pub fn write_hostname(&self, hostname: &str) -> Result<()> {
-        let ext4 = &self.0;
+        let path = "/etc/hostname";
 
-        // Open / create file
-        let hostname_file = ext4
-            .ext4_file_open("/etc/hostname", "w")
-            .map_err(|e| eyre!("Couldn't open /etc/hostname in the disk image:\n{e:#?}"))?;
-
-        // Sanitize hostname and convert to train case (https://docs.rs/convert_case/latest/convert_case/enum.Case.html#variant.Train)
-        let hostname = format!(
-            "ZBox-{}",
-            ccase!(
-                train,
-                hostname.chars().filter(char::is_ascii).collect::<String>()
-            )
-        );
+        // Clear file
+        if self.file_exists(path)? {
+            self.remove_file(path)?;
+        }
 
         // Write the hostname into the file
-        ext4.ext4_file_write(hostname_file.into(), 0, hostname.as_bytes())
-            .map_err(|e| eyre!("Couldn't write the hostname into the disk image:\n{e:#?}"))?;
+        let hostname_inode = self.open_file(path)?;
+        self.write_file(&hostname_inode, &hostname.to_owned())?;
 
         Ok(())
     }
 
     /// Writes two ssh keys for tcpdump and zfw respectively into /home/ziticli/.ssh/authorized_keys
     /// This allows to connect to the zitibox using ssh and checking requests on enp1s0
-    /// It also allows us to check applied 
+    /// It also allows us to check applied
     pub fn write_ssh_keys(&self) -> Result<()> {
-        todo!("
+        todo!(
+            "
         Write any ssh keys onto their respective line
         Be aware that the line will already contain a `command=` directive for the keys command
-        ")
+        "
+        )
     }
 }
 
@@ -158,23 +239,26 @@ impl TryFrom<PathBuf> for ZitiBoxImage {
     fn try_from(path: PathBuf) -> std::result::Result<Self, Self::Error> {
         // Read the partition table and find the start of the first partition
         let cfg = gpt::GptConfig::new().writable(false);
-        let disk = cfg.open(&path).wrap_err("Couldn't read a ")?;
-        let (_, partition) = disk
-            .partitions()
-            .first_key_value()
-            .ok_or_else(|| eyre!("Couldn't find a partition in the disk image"))?;
+        let disk = cfg
+            .open(&path)
+            .wrap_err("Couldn't read GPT Table of disk image. Is it a Ziti Box image?")?;
+        let (_, partition) = disk.partitions().first_key_value().ok_or_else(|| {
+            eyre!("Couldn't find a partition in the disk image. Is it a Ziti Box image?")
+        })?;
 
         if let Type { os: Linux, .. } = partition.part_type_guid {
             // Open the first partition as an ext4 block device
             let disk = Arc::new(DiskImage {
                 path,
-                partition_offset: usize::try_from(partition.first_lba).wrap_err("First logical block address doesn't fit into a pointer. Is this a 32-Bit system?")?,
+                partition_offset: usize::try_from(partition.first_lba).wrap_err(
+                    "First logical block address doesn't fit into usize. Is this a 32-Bit system?",
+                )?,
             });
             let ext4 = Ext4::open(disk);
             Ok(Self(ext4))
         } else {
             Err(eyre!(
-                "First partition in image does not contain an EXT4 Linux host"
+                "First partition in disk image does not contain an EXT4 Linux host. Is it a Ziti Box image?"
             ))
         }
     }

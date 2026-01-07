@@ -90,7 +90,7 @@ pub enum KeyStoreError {
 
 impl From<oo7::Error> for KeyStoreError {
     fn from(err: oo7::Error) -> Self {
-        KeyStoreError::Other(err.into())
+        Self::Other(err.into())
     }
 }
 
@@ -214,6 +214,7 @@ impl SecretManager for FreeDesktopSecretManager {
             .await
             .map_err(KeyStoreError::from)?;
 
+        // Check how many entries we got
         match entry.len() {
             // It is possible that the user changes the key store mode when having already created a config
             // This would result in requesting keys that dont exist (yet)
@@ -226,8 +227,7 @@ impl SecretManager for FreeDesktopSecretManager {
                 .and_then(|s| match s {
                     Secret::Text(ref t) => Ok(t.clone()), // Either return the Text variant
                     Secret::Blob(_) => Err(KeyStoreError::NonTextSecret(key.to_owned())), // Or error out
-                })
-                .map_err(KeyStoreError::from),
+                }),
             // I shouldn't need to check this since Secret Service attributes collections are unique, but you never know
             2.. => Err(KeyStoreError::DuplicateKey(key.to_owned())),
         }
@@ -244,7 +244,7 @@ impl SecretManager for FreeDesktopSecretManager {
                 true,
             )
             .await
-            .map_err(KeyStoreError::from);
+            .map_err(KeyStoreError::from)?;
 
         Ok(())
     }
