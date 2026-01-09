@@ -10,29 +10,32 @@ use color_eyre::{
 use ext4_rs::{BLOCK_SIZE, BlockDevice, Errno, Ext4, InodeFileType};
 use gpt::partition_types::OperatingSystem::Linux;
 use gpt::partition_types::Type;
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, Write};
+use log::{debug, trace, warn};
+use std::{io::{Read, Seek, Write}, net::Ipv4Addr};
+use std::{fs::OpenOptions, sync::Mutex};
 use std::{net::IpAddr, path::PathBuf, sync::Arc};
 
 const SECTOR_SIZE: usize = 512;
+const ROOT_INODE: u32 = 2;
 
 #[derive(Debug)]
 pub struct DiskImage {
-    path: PathBuf,
-    partition_offset: usize,
+    /// A handle to the file we want to work with
+    /// We use a Mutex for its interior mutability since [`BlockDevice`] doesn't allow `&mut self`
+    file: Mutex<std::fs::File>,
+    /// The offset of our host EXT4 partition
+    host_partition_offset: usize,
 }
 
 impl BlockDevice for DiskImage {
     fn read_offset(&self, mut offset: usize) -> Vec<u8> {
         // Correct our offset, our image has a sector size of
-        offset += self.partition_offset * SECTOR_SIZE;
+        offset += self.host_partition_offset * SECTOR_SIZE;
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .unwrap();
         let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut file = self.file.lock().unwrap();
+
+        // We allow failing quietly as is typical for a block device
         let _r = file.seek(std::io::SeekFrom::Start(offset as u64));
         let _r = file.read_exact(&mut buf);
 
@@ -41,14 +44,11 @@ impl BlockDevice for DiskImage {
 
     fn write_offset(&self, mut offset: usize, data: &[u8]) {
         // Correct our offset
-        offset += self.partition_offset * SECTOR_SIZE;
+        offset += self.host_partition_offset * SECTOR_SIZE;
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .unwrap();
+        let mut file = self.file.lock().unwrap();
 
+        // We allow failing quietly as is typical for a block device
         let _r = file.seek(std::io::SeekFrom::Start(offset as u64));
         let _r = file.write_all(data);
     }
@@ -64,13 +64,18 @@ impl ZitiBoxImage {
     /// Will either open or create the file at path (path from root)
     /// Returns the inode of this file
     fn open_file(&self, path: &str) -> Result<Inode> {
-        let mut root_inode = 2;
+        trace!("Opening file {path}");
+
+        let path = path.trim_start_matches('/');
+
         let inode_mode = InodeFileType::S_IFREG.bits();
+        #[allow(const_item_mutation)]
         let file_inode = &self
             .0
-            .generic_open(path, &mut root_inode, true, inode_mode, &mut 0)
+            .generic_open(path, &mut ROOT_INODE, true, inode_mode, &mut 0)
             .map_err(|e| eyre!("Couldn't get/create identity file inode:\n{e:#?}"))?;
 
+        trace!("Opened file {path} ({file_inode})");
         Ok(Inode(*file_inode))
     }
 
@@ -80,8 +85,11 @@ impl ZitiBoxImage {
 
     /// Writes into a file
     fn write_file_offset(&self, inode: &Inode, offset: usize, data: &impl ToString) -> Result<()> {
+        trace!("Writing data to file {}: {}", inode.0, data.to_string());
+
         let binding = data.to_string();
         let data = binding.as_bytes();
+
         let bytes_written = self
             .0
             .write_at(inode.0, offset, data)
@@ -99,6 +107,7 @@ impl ZitiBoxImage {
 
     /// Reads an entire file and returns the contents
     fn read_file(&self, inode: &Inode) -> Result<Vec<u8>> {
+        trace!("Reading file ({})", inode.0);
         let ext4 = &self.0;
 
         let inode_ref = ext4.get_inode_ref(inode.0);
@@ -122,13 +131,16 @@ impl ZitiBoxImage {
 
     /// Checks if a file exists
     fn file_exists(&self, path: &str) -> Result<bool> {
-        let mut root_inode = 2;
-        let inode_mode = InodeFileType::S_IFREG.bits();
-        let file_inode = self
-            .0
-            .generic_open(path, &mut root_inode, false, inode_mode, &mut 0);
+        trace!("Checking if file at {path} exists");
 
-        match file_inode {
+        let path = path.trim_start_matches('/');
+
+        let inode_mode = InodeFileType::S_IFREG.bits();
+        let result = self
+            .0
+            .generic_open(path, &mut ROOT_INODE, false, inode_mode, &mut 0);
+
+        match result {
             Ok(_) => Ok(true),
             Err(e) => {
                 if e.error() == Errno::ENOENT {
@@ -141,6 +153,8 @@ impl ZitiBoxImage {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
+        trace!("Removing file at {path}");
+
         self.0
             .file_remove(path)
             .map_err(|_| eyre!("Couldn't remove error"))
@@ -156,11 +170,14 @@ impl ZitiBoxImage {
     /// This creates a JWT file inside the /opt/openziti/etc/identities\
     /// The jwt parameter is written as the content of the file
     pub fn write_ziti_jwt(&self, jwt: &str) -> Result<()> {
+        debug!("Writing JWT to Ziti Box image");
+
         let path = "/opt/openziti/etc/identities/identity.jwt";
+        let file_contents = format!("{jwt}\n");
 
         // Write the jwt into the file
         let jwt_inode = self.open_file(path)?;
-        self.write_file(&jwt_inode, &jwt.to_owned())?;
+        self.write_file(&jwt_inode, &file_contents)?;
 
         Ok(())
     }
@@ -169,6 +186,7 @@ impl ZitiBoxImage {
     /// This may be needed for when our controller isn't publicly available.\
     /// **The host parameter is trusted at this stage**, make sure you check it (regex or something)
     pub fn write_hosts_entry(&self, ip: IpAddr, host: &str) -> Result<()> {
+        debug!("Writing hosts entry to Ziti Box Image");
         let hosts_path = "/etc/hosts";
         let backup_path = "/etc/hosts.bak";
 
@@ -176,6 +194,8 @@ impl ZitiBoxImage {
         // this is because we change the image in place and not copy it
         // Otherwise we would accumulate more and more hosts entries which we don't want
         let (hosts_file, hosts_contents) = if self.file_exists(backup_path)? {
+            debug!("Restoring hosts backup");
+
             // If a backup exists restore that
             self.remove_file(hosts_path)?;
             let backup = self.open_file(backup_path)?;
@@ -186,6 +206,8 @@ impl ZitiBoxImage {
 
             (hosts_file, contents) // return the created hosts file and its contents
         } else {
+            debug!("Creating hosts backup");
+
             // If no backup exists create one
             let hosts_file = self.open_file(hosts_path)?;
             let contents = String::from_utf8(self.read_file(&hosts_file)?)?;
@@ -196,16 +218,20 @@ impl ZitiBoxImage {
             (hosts_file, contents) // return the original hosts file and its contens
         };
 
-        let entry = format!("\n# Ziti Box CLI\n{ip} {host}");
-        self.write_file_offset(&hosts_file, hosts_contents.len(), &entry)?;
+        debug!("Inserting hosts entry");
+        let file_addition = format!("\n# Ziti Box CLI\n{ip} {host}\n");
+        self.write_file_offset(&hosts_file, hosts_contents.len(), &file_addition)?;
 
         Ok(())
     }
 
     /// This writes the hostname of the Ziti Box into the /etc/hostname file.\
-    /// This is not required for OpenZiti but makes our underlying network less confusing.\
+    /// This is not required for OpenZiti but makes our underlying network less confusing.
     pub fn write_hostname(&self, hostname: &str) -> Result<()> {
+        debug!("Writing hostname to Ziti Box image");
+
         let path = "/etc/hostname";
+        let file_contents = format!("{hostname}\n");
 
         // Clear file
         if self.file_exists(path)? {
@@ -214,7 +240,7 @@ impl ZitiBoxImage {
 
         // Write the hostname into the file
         let hostname_inode = self.open_file(path)?;
-        self.write_file(&hostname_inode, &hostname.to_owned())?;
+        self.write_file(&hostname_inode, &file_contents)?;
 
         Ok(())
     }
@@ -224,10 +250,8 @@ impl ZitiBoxImage {
     /// It also allows us to check applied
     pub fn write_ssh_keys(&self) -> Result<()> {
         todo!(
-            "
-        Write any ssh keys onto their respective line
-        Be aware that the line will already contain a `command=` directive for the keys command
-        "
+            "Write any ssh keys onto their respective line\n\
+            Be aware that the line will already contain a `command=` directive for the keys command"
         )
     }
 }
@@ -237,6 +261,11 @@ impl TryFrom<PathBuf> for ZitiBoxImage {
     type Error = eyre::Report;
 
     fn try_from(path: PathBuf) -> std::result::Result<Self, Self::Error> {
+        debug!(
+            "Trying to construct ZitiBoxImage from file at {}",
+            path.display()
+        );
+
         // Read the partition table and find the start of the first partition
         let cfg = gpt::GptConfig::new().writable(false);
         let disk = cfg
@@ -247,10 +276,18 @@ impl TryFrom<PathBuf> for ZitiBoxImage {
         })?;
 
         if let Type { os: Linux, .. } = partition.part_type_guid {
+            // Open the file in read/write mode
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .wrap_err("Couldn't open disk image in r/w mode")?;
+            let file = Mutex::new(file);
+
             // Open the first partition as an ext4 block device
             let disk = Arc::new(DiskImage {
-                path,
-                partition_offset: usize::try_from(partition.first_lba).wrap_err(
+                file,
+                host_partition_offset: usize::try_from(partition.first_lba).wrap_err(
                     "First logical block address doesn't fit into usize. Is this a 32-Bit system?",
                 )?,
             });
@@ -262,4 +299,40 @@ impl TryFrom<PathBuf> for ZitiBoxImage {
             ))
         }
     }
+}
+
+// =========================== Tests ===============================
+
+pub fn image() -> ZitiBoxImage {
+    let image_path = PathBuf::from("/home/samuel/ZitiBox.img");
+    ZitiBoxImage::try_from(image_path).unwrap()
+}
+
+/// This should check mostly for segfaults
+#[test]
+fn write_jwt() {
+    let image = image();
+
+    let jwt = "eyJhbGciOiJSUzI1NiIsImtpZCI6Ijg5YzY0MzM0MmQ5NGY4YTM3MmNlMDNiNzQzODFjNjg4OGMwNmY1ZjkiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3ppdGkucG9tbWVyLmluZm86MTI4MCIsInN1YiI6Ii1GNjhrTlVvOCIsImF1ZCI6WyIiXSwiZXhwIjoxNzY3NzU0MDc0LCJqdGkiOiIwM2M3NmE3NS1hZmJiLTQ1MmMtOWE2Ny0yODU4MmM5NjE0MWMiLCJlbSI6Im90dCIsImN0cmxzIjpbInRsczp6aXRpLnBvbW1lci5pbmZvOjEyODAiXX0.DSR3DUXUAsfJ7VMpLlsxyk5wjZkSQms9smM990Nu3--iS3zLb9AmpaWR4-JOIjtvImzWdoyvLmE4TO4k5vwMM92mjaYGRG3i3QECpcgflWZowPXlZC3hF2B2TgSHjvDLCT3Sdixg_7TbNmrnoqETy3pCrPK3_EWyN52b5gwDmYDsGCIfePRqisF51W6NdKZzLD9KQaRE8sN8jhVnwPxrQF53DNBwuGk-n2BsMwGQulCCk1iLiRGMQ8xIDRCWTHMZkfjQYknUKkFFFRxbfsw-JEsnN-N5Yj_fxsOJO1evf1hOSjA6N65iEj5LZDj6vpAQUV1h9uj72Ma_-tJ3THMb4bMgI-EaUNUdD-PflqSejcKjzzy8HhntWQYNAR-Au8oFeu13kRsJG4wEYvEoKSpv5RsXfgNP3ykv97YklwKgMuvLoUlnlxU8OHKn_E-bPEEJRhGByEHvjJjzda4XJwDNFLyvtdFJtMp1JjQQ12vVd9ou3dXLdM-fKDTs_ak_cI8_lhmZg52c71XVmLcRfzucWoF9KPvb6IqRgYCkjFQrAzmnX12BX6w92tVo2fvPiGxuPc_wWvrw4MBoaDgEOiK4zbxFAHzu5y_LsjqjMiu6tGKqUxU7e4Vz9zb67simLmiTHiy1g_ozWttXzUR8tEIb9T1Yfnw0Z8JduNb-oaZLmys";
+
+    image.write_ziti_jwt(jwt).unwrap();
+}
+
+#[test]
+fn write_hostname() {
+    let image = image();
+
+    let hostname = "ZBox-Test-Box-A";    
+
+    image.write_hostname(hostname).unwrap();
+}
+
+#[test]
+fn write_hosts_entry() {
+    let image = image();
+
+    let ip= IpAddr::V4(Ipv4Addr::new(192, 168, 175, 2));
+    let host = "ziti.box";
+        
+    image.write_hosts_entry(ip, host).unwrap();
 }

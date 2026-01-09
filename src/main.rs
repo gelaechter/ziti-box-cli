@@ -14,7 +14,8 @@ mod secrets;
 mod ssh;
 
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+
+use clap::{ArgAction, Parser, Subcommand};
 use color_eyre::{
     Result,
     eyre::{Context, eyre},
@@ -24,12 +25,14 @@ use comfy_table::Table;
 use convert_case::ccase;
 use dialoguer::{Confirm, Input, Password, Select};
 use glob::glob;
+use log::LevelFilter;
+use oo7::ashpd::desktop::file_chooser::Choice;
 use owo_colors::{
     FgColorDisplay, SupportsColorsDisplay,
     colors::{BrightRed, Cyan, Green},
 };
 use reqwest::Url;
-use std::{fs, net::IpAddr, path::PathBuf, str::FromStr};
+use std::{f16::consts::E, fs, net::IpAddr, path::PathBuf, str::FromStr};
 use ziti_api::models::{IdentityEnrollmentsOtt, identity_detail::EdgeRouterConnectionStatus};
 
 use crate::{
@@ -50,6 +53,9 @@ struct Args {
     /// Only activate this if there is no way to install a provider like GNOME Keyring or KDE Wallet
     #[arg(long)]
     pub basic_keystore: bool,
+    /// Increase verbosity (repeat for more: -v info, -vv debug, -vvv trace)
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
     /// Which action to execute
     #[clap(subcommand)]
     pub subcommand: SubCommands,
@@ -129,6 +135,16 @@ async fn main() -> Result<()> {
 /// This starts the cli
 pub async fn cli() -> Result<()> {
     let args = Args::parse();
+
+    // Set logger verbosity
+    env_logger::Builder::new()
+        .filter_level(match args.verbose {
+            0 => LevelFilter::Warn,
+            1 => LevelFilter::Info,
+            2 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
+        })
+        .init();
 
     // Allow the user to disable using a FreeDesktop Secret Service
     let key_store: KeyStore = if args.basic_keystore {
@@ -261,10 +277,10 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
                             || "Ready to enroll".to_string(),
                             |expires| format!("Ready to enroll ({expires})"),
                         )
-                        .bright_blue()
+                        .info()
                         .to_string()
                 }
-                EnrollmentState::Unknown => "Unknown enrollment state".info().to_string(),
+                EnrollmentState::Unknown => "Unknown enrollment state".alert().to_string(),
             },
             // services
         ]);
@@ -288,13 +304,14 @@ async fn cmd_image(
         EnrollmentState::from(&*ziti_box.enrollment),
         EnrollmentState::ReadyToEnroll
     ) {
+        let enroll_prompt = format!(
+            "The Ziti Box \"{}\" not ready to be enrolled.\n\
+            Do you want to re-enroll the Ziti Box?",
+            ziti_box.name
+        );
+
         if Confirm::new() // If it isn't then offer to reset enrollment
-            .with_prompt(
-                "This ZitiBox is not ready to be enrolled.\n\
-                Do you want to re-enroll the Ziti Box?"
-                    .info()
-                    .to_string(),
-            )
+            .with_prompt(enroll_prompt.info().to_string())
             .interact()?
         {
             // Re-enroll it, then fetch the new enrollment
@@ -359,7 +376,11 @@ async fn cmd_image(
         "ZBox-{}",
         ccase!(
             train,
-            &ziti_box.name.chars().filter(char::is_ascii).collect::<String>()
+            &ziti_box
+                .name
+                .chars()
+                .filter(char::is_ascii)
+                .collect::<String>()
         )
     );
 
@@ -721,16 +742,26 @@ pub fn choose_image() -> Result<Option<PathBuf>> {
         0 => None,
         1 => {
             let message = format!(
-                "Using disk image {}",
+                "Found only disk image {}",
                 paths.first().expect("Guaranteed by len=1 match").display()
             );
             println!("{}", message.info());
-            Some(paths.first().expect("Guaranteed through len == 1 check"))
+            // Offer using this single image
+            if Confirm::new() 
+                .with_prompt("Do you wish to use this image".info().to_string())
+                .default(false)
+                .interact()?
+            {
+                Some(paths.first().expect("Guaranteed through len == 1 check"))
+            } else {
+                None
+            }
         }
         2.. => {
             let answer = Select::new()
                 .with_prompt("Found multiple disk images, choose one".info().to_string())
                 .items(paths.iter().map(|path| path.display().to_string()))
+                .default(0)
                 .interact()?;
             Some(&paths[answer])
         }
