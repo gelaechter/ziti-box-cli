@@ -97,9 +97,7 @@ impl ZitiConfig {
 
     /// Loads the config from disk
     pub async fn load() -> Result<Option<Self>, ZitiApiError> {
-        Self::load_from_file(&CONFIG_PATH)
-            .await
-            .map_err(Into::into)
+        Self::load_from_file(&CONFIG_PATH).await.map_err(Into::into)
     }
 }
 
@@ -291,8 +289,6 @@ impl ZitiApi {
         create_enrollment(
             &self.conf,
             EnrollmentCreate {
-                // FIXME: This results in a 180 minute enrollment time in CET (UTC +1)
-                // Does OpenZiti not actually default to UTC for enrollments?
                 expires_at: (Utc::now() + Duration::minutes(30)).to_rfc3339(),
                 identity_id: zitibox.id,
                 method: Method::Ott,
@@ -385,17 +381,19 @@ impl ZitiApi {
             .join(",");
         let service_name = format!("{zitibox_name} {address} ({ports_string})");
 
-        // Check config types
+        // Fetch host.v1 and intercept.v1 configs
         let mut types = list_config_types(&self.conf, None, None, None)
             .await?
             .data
             .into_iter();
+
         let host_v1 =
             types
                 .find(|conf| conf.name == "host.v1")
                 .ok_or(ZitiApiError::MalformedResponse(
                     "Response didn't contain a host.v1 configuration".to_owned(),
                 ))?;
+
         let intercept_v1 = types.find(|conf| conf.name == "intercept.v1").ok_or(
             ZitiApiError::MalformedResponse(
                 "Response didn't contain an intercept.v1 configuration".to_owned(),
@@ -571,7 +569,10 @@ impl std::fmt::Display for Port {
 pub enum EnrollmentState {
     Enrolled,
     Expired,
-    ReadyToEnroll,
+    ReadyToEnroll {
+        /// The number of minutes until this enrollment expires
+        minutes_left: i64,
+    },
     Unknown,
 }
 
@@ -585,10 +586,11 @@ impl From<&IdentityEnrollments> for EnrollmentState {
                 if let Some(date) = &ott.expires_at
                     && let Ok(ott_expiration) = date.parse::<DateTime<Utc>>()
                 {
-                    if ott_expiration < Utc::now() {
-                        Self::Expired
+                    let minutes_left = (ott_expiration - Utc::now()).num_minutes();
+                    if minutes_left > 0 {
+                        Self::ReadyToEnroll { minutes_left }
                     } else {
-                        Self::ReadyToEnroll
+                        Self::Expired
                     }
                 } else {
                     Self::Unknown

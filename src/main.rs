@@ -1,3 +1,4 @@
+#![feature(type_alias_impl_trait)]
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 #![allow(clippy::doc_markdown)]
@@ -13,8 +14,6 @@ mod image;
 mod secrets;
 mod ssh;
 
-use chrono::{DateTime, Utc};
-
 use clap::{ArgAction, Parser, Subcommand};
 use color_eyre::{
     Result,
@@ -26,14 +25,13 @@ use convert_case::ccase;
 use dialoguer::{Confirm, Input, Password, Select};
 use glob::glob;
 use log::LevelFilter;
-use oo7::ashpd::desktop::file_chooser::Choice;
 use owo_colors::{
     FgColorDisplay, SupportsColorsDisplay,
     colors::{BrightRed, Cyan, Green},
 };
 use reqwest::Url;
-use std::{f16::consts::E, fs, net::IpAddr, path::PathBuf, str::FromStr};
-use ziti_api::models::{IdentityEnrollmentsOtt, identity_detail::EdgeRouterConnectionStatus};
+use std::{fs, net::IpAddr, path::PathBuf, str::FromStr};
+use ziti_api::models::identity_detail::EdgeRouterConnectionStatus;
 
 use crate::{
     api::{CONFIG_PATH, EnrollmentState, Port, ZitiApi, ZitiApiError, ZitiConfig},
@@ -245,7 +243,7 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
     table.set_header(vec!["Id", "Status", "Name", "Enrollment"]);
 
     for zitibox in identities {
-        // FIXME: Currently doesn't work because of: https://openziti.discourse.group/t/openapi-spec-mismatch-servicedetail-config-nullability/5457
+        // FIXME: Currently doesn't work because of: https://github.com/openziti/ziti/issues/3481
         // let services = ziti_api.list_identity_services(&zitibox.id)
         //     .await?
         //     .into_iter()
@@ -264,19 +262,8 @@ async fn cmd_list_ziti_boxes() -> Result<()> {
             match EnrollmentState::from(&*zitibox.enrollment) {
                 EnrollmentState::Enrolled => "Already enrolled".success().to_string(),
                 EnrollmentState::Expired => "Enrollment expired".alert().to_string(),
-                EnrollmentState::ReadyToEnroll => {
-                    let ott = zitibox
-                        .enrollment
-                        .ott
-                        .expect("Implied through ReadyToEnroll");
-
-                    let expiration = pretty_expiration(&ott);
-
-                    expiration
-                        .map_or_else(
-                            || "Ready to enroll".to_string(),
-                            |expires| format!("Ready to enroll ({expires})"),
-                        )
+                EnrollmentState::ReadyToEnroll { minutes_left } => {
+                    format!("Ready to enroll ({minutes_left}m)")
                         .info()
                         .to_string()
                 }
@@ -299,19 +286,28 @@ async fn cmd_image(
     let ziti_api = construct_ziti_api().await?;
     let mut ziti_box = ziti_api.get_ziti_box(ziti_box_id.clone()).await?;
 
-    // Check if the ZitiBox is ready to enroll
-    if !matches!(
-        EnrollmentState::from(&*ziti_box.enrollment),
-        EnrollmentState::ReadyToEnroll
-    ) {
-        let enroll_prompt = format!(
-            "The Ziti Box \"{}\" not ready to be enrolled.\n\
-            Do you want to re-enroll the Ziti Box?",
+    // Check if the Ziti Box is ready to enroll
+    let prompt = match EnrollmentState::from(&*ziti_box.enrollment) {
+        // About to expire
+        EnrollmentState::ReadyToEnroll { minutes_left } if minutes_left < 5 => Some(format!(
+            "The enrollment of Ziti Box \"{}\" is about to expire.",
             ziti_box.name
-        );
+        )),
+        // Ready to enroll
+        EnrollmentState::ReadyToEnroll { .. } => None,
+        // Everything else
+        _ => Some(format!(
+            "Ziti Box \"{}\" is not ready to be enrolled.",
+            ziti_box.name
+        )),
+    };
 
-        if Confirm::new() // If it isn't then offer to reset enrollment
-            .with_prompt(enroll_prompt.info().to_string())
+    if let Some(prompt) = prompt {
+        // The Ziti Box is not ready to be enrolled, so offer to re-enroll
+        println!("{}", prompt.info());
+        if Confirm::new()
+            .with_prompt("Do you want to reset the enrollment of the Ziti Box?".info().to_string())
+            .default(false)
             .interact()?
         {
             // Re-enroll it, then fetch the new enrollment
@@ -319,6 +315,7 @@ async fn cmd_image(
             ziti_box = ziti_api.get_ziti_box(ziti_box_id).await?;
         } else {
             // Otherwise abort
+            println!("{}", "Aborting image creation.".info());
             return Ok(());
         }
     }
@@ -352,6 +349,7 @@ async fn cmd_image(
         );
         let copy = Confirm::new()
             .with_prompt("Create a backup now?".info().to_string())
+            .default(true)
             .interact()?;
 
         if copy {
@@ -385,12 +383,13 @@ async fn cmd_image(
     );
 
     // Write Hostname
-    image.write_hostname(&hostname)?;
+    // FIXME: Writing the hostname or doing that in combination with the JWT corrupts the image to so much that it becomes unbootable
+    // image.write_hostname(&hostname)?;
 
     // Write Hosts entry
-    if let Some(hosts_entry) = host_entry {
-        image.write_hosts_entry(hosts_entry.ip, &hosts_entry.host)?;
-    }
+    // if let Some(hosts_entry) = host_entry {
+    //     image.write_hosts_entry(hosts_entry.ip, &hosts_entry.host)?;
+    // }
 
     println!(
         "{}",
@@ -611,10 +610,14 @@ async fn cmd_monitor_ziti_box(ziti_box_id: String) -> Result<()> {
     todo!()
 }
 
-/// Define wrappers for colors\
-/// TODO: The types used here are a crime but i can't be bothered to alias them right now
+/// Wrappers around [`OwoColorize`] color methods ensure consistent colors\
+/// They are only applied if the terminal supports them
+/// 
+/// # Example
+/// ```rust
+/// println!("{}", "This worked".success()) // this will appear green in terminals that support it
+/// ```
 pub trait TextColors: Sized {
-    /// Colors anything that supports displaying (is sized)
     fn alert<'a>(
         &'a self,
     ) -> SupportsColorsDisplay<
@@ -700,28 +703,7 @@ fn parse_port(s: &str) -> Result<Port, String> {
     }
 }
 
-/// If the OTT has an expiration this will return the remaining time as a pretty printed string\
-/// If 30 seconds are left this will yield "30s"\
-/// If 30 minutes are left this will yield "30m"
-#[must_use]
-pub fn pretty_expiration(ott: &IdentityEnrollmentsOtt) -> Option<String> {
-    ott.expires_at
-        .as_ref()
-        .and_then(|exp| exp.parse::<DateTime<Utc>>().ok())
-        .map(|exp| exp - Utc::now())
-        .map(|duration| {
-            let seconds = duration.num_seconds();
-            let minutes = seconds / 60;
-
-            if minutes > 0 {
-                format!("{minutes}m")
-            } else {
-                format!("{seconds}s")
-            }
-        })
-}
-
-#[allow(clippy::missing_panics_doc)] // I don't know why clippy complains here
+#[allow(clippy::missing_panics_doc)] // I don't know why clippy complains here, possible panics are guarded by matches
 pub fn choose_image() -> Result<Option<PathBuf>> {
     // Directories we want to search with a *.img globbing pattern
     let home_dir = dirs_next::home_dir().ok_or_else(
@@ -747,7 +729,7 @@ pub fn choose_image() -> Result<Option<PathBuf>> {
             );
             println!("{}", message.info());
             // Offer using this single image
-            if Confirm::new() 
+            if Confirm::new()
                 .with_prompt("Do you wish to use this image".info().to_string())
                 .default(false)
                 .interact()?

@@ -33,6 +33,9 @@ thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 ziti_api = { package = "ziti_edge_management_api", git = "https://github.com/gelaechter/ziti_edge_management_api.git", tag = "0.26.51" }
 
+# See https://github.com/z-galaxy/zbus/issues/1665
+zvariant_derive = "=5.8.0"
+
 # See https://github.com/yuoo655/ext4_rs/issues/10
 [patch.crates-io]
 ext4_rs = { git = "https://github.com/gelaechter/ext4_rs.git" }

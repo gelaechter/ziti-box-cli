@@ -1,7 +1,19 @@
 //! This module contains all the logic to write data to a Ziti Box Disk Image
 //!
 //! To do this we read the raw data in the disk image using the filesystem and treat it as a block device
-//! This way image modificatoin should be OS agnostic and be possible without root/administrator priviledges since we're not actually mounting anything.
+//! This way image modification should be OS agnostic and be possible without root/administrator priviledges since we're not actually mounting anything.
+//! 
+//! ## Issues
+//! 
+//! The used crate ext4_rs mostly works. It can however corrupt the filesystem if lesser tested functions are used.
+//! Tested and verified functions include:
+//!     - [`Ext4::generic_open`]
+//!     - [`Ext4::read_at`]
+//! 
+//! ## Alternative
+//! 
+//! Alternatively we could also just use a unix loop device to mount the disk image as a directory.
+//! Then we could operate normally on it. This does however restrict ZBC to usage on unix devices AND require root.
 
 use color_eyre::{
     Result,
@@ -10,8 +22,8 @@ use color_eyre::{
 use ext4_rs::{BLOCK_SIZE, BlockDevice, Errno, Ext4, InodeFileType};
 use gpt::partition_types::OperatingSystem::Linux;
 use gpt::partition_types::Type;
-use log::{debug, trace, warn};
-use std::{io::{Read, Seek, Write}, net::Ipv4Addr};
+use log::{debug, trace};
+use std::io::{Read, Seek, Write};
 use std::{fs::OpenOptions, sync::Mutex};
 use std::{net::IpAddr, path::PathBuf, sync::Arc};
 
@@ -25,6 +37,23 @@ pub struct DiskImage {
     file: Mutex<std::fs::File>,
     /// The offset of our host EXT4 partition
     host_partition_offset: usize,
+}
+
+impl DiskImage {
+    pub fn new(path: PathBuf, host_partition_offset: usize) -> Result<Self> {
+        // Open the file in read/write mode
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .wrap_err("Couldn't open disk image in r/w mode")?;
+        let file = Mutex::new(file);
+
+        Ok(Self {
+            file,
+            host_partition_offset,
+        })
+    }
 }
 
 impl BlockDevice for DiskImage {
@@ -65,8 +94,6 @@ impl ZitiBoxImage {
     /// Returns the inode of this file
     fn open_file(&self, path: &str) -> Result<Inode> {
         trace!("Opening file {path}");
-
-        let path = path.trim_start_matches('/');
 
         let inode_mode = InodeFileType::S_IFREG.bits();
         #[allow(const_item_mutation)]
@@ -132,8 +159,6 @@ impl ZitiBoxImage {
     /// Checks if a file exists
     fn file_exists(&self, path: &str) -> Result<bool> {
         trace!("Checking if file at {path} exists");
-
-        let path = path.trim_start_matches('/');
 
         let inode_mode = InodeFileType::S_IFREG.bits();
         let result = self
@@ -266,49 +291,45 @@ impl TryFrom<PathBuf> for ZitiBoxImage {
             path.display()
         );
 
-        // Read the partition table and find the start of the first partition
+        // Read the partition table
         let cfg = gpt::GptConfig::new().writable(false);
         let disk = cfg
             .open(&path)
-            .wrap_err("Couldn't read GPT Table of disk image. Is it a Ziti Box image?")?;
-        let (_, partition) = disk.partitions().first_key_value().ok_or_else(|| {
-            eyre!("Couldn't find a partition in the disk image. Is it a Ziti Box image?")
-        })?;
+            .wrap_err("Couldn't read GPT table of disk image. Is it a Ziti Box image?")?;
 
-        if let Type { os: Linux, .. } = partition.part_type_guid {
-            // Open the file in read/write mode
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .wrap_err("Couldn't open disk image in r/w mode")?;
-            let file = Mutex::new(file);
+        // Find the first linux partition
+        let (_, partition) = disk
+            .partitions()
+            .iter()
+            .find(|(_, partition)| matches!(partition.part_type_guid, Type { os: Linux, .. }))
+            .ok_or_else(|| {
+                eyre!(
+                    "Can't find a Linux host partition in the disk image. Is it a Ziti Box image?"
+                )
+            })?;
 
-            // Open the first partition as an ext4 block device
-            let disk = Arc::new(DiskImage {
-                file,
-                host_partition_offset: usize::try_from(partition.first_lba).wrap_err(
-                    "First logical block address doesn't fit into usize. Is this a 32-Bit system?",
-                )?,
-            });
-            let ext4 = Ext4::open(disk);
-            Ok(Self(ext4))
-        } else {
-            Err(eyre!(
-                "First partition in disk image does not contain an EXT4 Linux host. Is it a Ziti Box image?"
-            ))
-        }
+        // Open the linux partition as a block device
+        let disk = Arc::new(DiskImage::new(
+            path,
+            usize::try_from(partition.first_lba).wrap_err(
+                "First logical block address doesn't fit into usize. Is this a 32-Bit system?",
+            )?,
+        )?);
+
+        // Open the block device as an ext4 partition
+        let ext4 = Ext4::open(disk);
+        Ok(Self(ext4))
     }
 }
 
 // =========================== Tests ===============================
+// I created these for debugging https://github.com/yuoo655/ext4_rs/issues/10
 
 pub fn image() -> ZitiBoxImage {
     let image_path = PathBuf::from("/home/samuel/ZitiBox.img");
     ZitiBoxImage::try_from(image_path).unwrap()
 }
 
-/// This should check mostly for segfaults
 #[test]
 fn write_jwt() {
     let image = image();
@@ -322,7 +343,7 @@ fn write_jwt() {
 fn write_hostname() {
     let image = image();
 
-    let hostname = "ZBox-Test-Box-A";    
+    let hostname = "ZBox-Test-Box-A";
 
     image.write_hostname(hostname).unwrap();
 }
@@ -331,8 +352,8 @@ fn write_hostname() {
 fn write_hosts_entry() {
     let image = image();
 
-    let ip= IpAddr::V4(Ipv4Addr::new(192, 168, 175, 2));
+    let ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 175, 2));
     let host = "ziti.box";
-        
+
     image.write_hosts_entry(ip, host).unwrap();
 }

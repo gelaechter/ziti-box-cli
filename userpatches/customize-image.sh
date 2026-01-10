@@ -66,8 +66,8 @@ network:
     ethernets:
         end0:
             dhcp4: true
-            optional: true
         enp1s0:
+            ignore-carrier: true
             addresses:
             - 10.1.1.1/24
     version: 2
@@ -86,7 +86,7 @@ subnet 10.1.1.0 netmask 255.255.255.0 {
   option routers 10.1.1.1;
   default-lease-time -1;
   max-lease-time -1;
-  ping-check;
+  ping-check true;
   authoritative;
 }
 EOF
