@@ -78,6 +78,19 @@ chmod a=,u=rw /etc/netplan/50-zitibox.yaml
 netplan generate
 netplan apply
 
+# Activate multicast DNS globally to allow hostname resolution
+cat <<"EOF" > /etc/systemd/resolved.conf
+[Resolve]
+MulticastDNS=yes
+EOF
+
+# Activate multicast DNS for end0
+mkdir -p /etc/systemd/network/10-netplan-end0.network.d
+cat <<"EOF" > /etc/systemd/network/10-netplan-end0.network.d/override.conf
+[Network]
+MulticastDNS=yes
+EOF
+
 # Configure dhcpd
 cat <<"EOF" > /etc/dhcp/dhcpd.conf
 subnet 10.1.1.0 netmask 255.255.255.0 {
